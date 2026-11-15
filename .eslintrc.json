@@ -1,0 +1,12 @@
+{
+  "extends": "next/core-web-vitals",
+  "ignorePatterns": ["node_modules", ".next", "dist", "supabase/**"],
+  "overrides": [
+    {
+      "files": ["src/accounting/**/*.ts", "src/accounting/**/*.tsx"],
+      "rules": {
+        "@typescript-eslint/no-explicit-any": "error"
+      }
+    }
+  ]
+}
