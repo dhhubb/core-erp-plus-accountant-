@@ -24,6 +24,7 @@ migrations, and Prisma usually connects as a role that bypasses RLS.
 - [Inventory](#inventory)
 - [Sales and purchases](#sales-and-purchases)
 - [Retail extension (R1)](#retail-extension-r1)
+- [Retail extension (R2)](#retail-extension-r2)
 - [Adding a vertical module](#adding-a-vertical-module)
 - [Tests, checks and the perf run](#tests-checks-and-the-perf-run)
 
@@ -93,9 +94,19 @@ erDiagram
     invoices ||--|{ invoice_lines : contains
     invoices ||--o{ payments : settled_by
     invoices ||--o{ credit_notes : credited_by
+    invoices ||--o{ manual_discounts : discounted_by
     contacts ||--o{ invoices : billed_to
     contacts ||--o{ purchase_orders : ordered_from
+    contacts }o--o| customer_groups : belongs_to
     journals ||--o| invoices : posts_for
+
+    organizations ||--o{ price_lists : has
+    price_lists ||--o{ price_list_items : lists
+    product_variants ||--o{ price_list_items : priced_by
+    organizations ||--o{ customer_groups : has
+    customer_groups }o--o| price_lists : prices_at
+    organizations ||--o{ promotions : has
+    organizations ||--o{ discount_limits : caps
 
     organizations {
         uuid id PK
@@ -344,6 +355,32 @@ clause (that clause blocks inlining) and its body is a parenthesised `UNION ALL`
 (a CTE is materialised, which hides the constant term from the planner). Every object is
 schema-qualified, so inlining is safe.
 
+## Retail extension (R2)
+
+R2 adds pricing and promotions. It is additive: the only core-table change is a nullable
+`contacts.group_id`, recorded in ADR-0011. See ADR-0011 to ADR-0013 and `docs/CORE_INTERFACE.md`.
+
+- **Price lists.** `price_lists` (one `retail`, one `wholesale` per org) and `price_list_items`
+  (unique per list and variant). A `customer_groups` row may point at a wholesale list.
+- **Promotions.** `promotions` carries `type` (`bogo`, `percent`, `fixed`), a `valid_from` /
+  `valid_to` window, a `priority`, a `stackable` flag and a `conditions` object
+  (`variant_ids`, `min_qty`, `min_subtotal`, `value`).
+- **Manual discounts.** `discount_limits` caps a discount per role (a role with no row has a limit
+  of zero, so a manual discount is opt-in). `manual_discounts` records every discount with its
+  reason.
+- **Precedence**, enforced in one place (`app.get_price` / `app.get_prices`):
+  1. the customer group's price list, falling back to the retail list per item;
+  2. active promotions by priority, stacking only when both the primary and the follower are
+     stackable;
+  3. a manual discount for a role that is allowed one, with a reason.
+- **Endpoints.** `POST /api/pos/price` resolves a whole cart in one round trip over
+  `src/verticals/retail/pricing.ts`. A 30-item cart costs one batched query (plus one candidates
+  read on a cold cache), never one query per item.
+- **Redis.** Promotion *candidates* are cached under `promos:{org_id}` with a 300-second TTL, never
+  a resolved price. Every evaluation re-checks the validity window in SQL, so a stale entry cannot
+  apply an expired promotion; the cache is rebuildable and losing it costs one read. A write to
+  `promotions` invalidates the key.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -353,7 +390,9 @@ table without an ADR.
    `supabase/migrations/<timestamp>_pharmacy_*.sql` for its own tables.
 2. Depend only on core functions: `app.post_journal`, `app.post_receipt`, `app.create_invoice`,
    `app.allocate_payment`, `app.create_credit_note`, `app.post_stock_adjustment`,
-   `app.next_number`, `app.ensure_partitions`. Call them, do not reimplement them.
+   `app.next_number`, `app.ensure_partitions`. Call them, do not reimplement them. A pricing-aware
+   vertical also uses `app.get_price`, `app.get_prices`, `app.apply_promotions` and
+   `app.assert_manual_discount` rather than its own copy of the precedence rules.
 3. Scope every new table by `org_id` (and `branch_id` when it is branch-scoped), and apply the same
    RLS, index and partition rules as the core: `select app.apply_tenant_rls('public.your_table',
    'org')` or `'branch'`.
@@ -363,14 +402,18 @@ table without an ADR.
 ## Tests, checks and the perf run
 
 ```bash
-npm test          # 40 tests against the real local database
+npm test          # the tests against the real local database
 npm run build     # production build
 npm run lint      # ESLint, including the no-any rule for src/accounting
 npm run test:perf # seed 1M journal lines, EXPLAIN ANALYZE, write docs/perf/
 ```
 
-`npm test` runs the 40 tests in `tests/`. The database is never mocked. Tenancy tests act as a user
+`npm test` runs the tests in `tests/`. The database is never mocked. Tenancy tests act as a user
 by setting the role and the JWT claims inside a transaction, never as the `postgres` superuser.
+
+The R2 tests use a real Redis, which must be running (`REDIS_URL`, default
+`redis://127.0.0.1:6379`). They are not mocked: the cache assertions read the real key back, and the
+"stale promotion" test writes a real Redis key with a real TTL.
 
 `npm run test:perf` seeds 1,000,000 journal lines with `generate_series` inside SQL, then runs
 `EXPLAIN ANALYZE` on a one-month trial balance and on a full-range trial balance. The one-month
@@ -380,7 +423,7 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 `src/accounting/**` is checked by an ESLint override that sets
 `@typescript-eslint/no-explicit-any` to `error`. `npm run lint` fails if `any` appears there.
 
-### The 40 tests
+### The tests
 
 | Range | Area | File |
 | --- | --- | --- |
@@ -390,6 +433,8 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 | 25–31 | Inventory | `tests/inventory.test.ts` |
 | 32–37 | Sales and purchases | `tests/sales.test.ts` |
 | 38–40 | Concurrency | `tests/sales.test.ts` |
+| 41–44 | R1: products, barcodes, search | `tests/retail-r1.test.ts` |
+| 45–48 | R2: pricing and promotions | `tests/retail-r2.test.ts` |
 
 ## Documentation
 

@@ -145,3 +145,56 @@ already states.
 
 **Consequence.** Test numbers are allocated in the order items are actually built, so no number is
 skipped and no two runs collide.
+
+## ADR-0011 — R2 adds a nullable `contacts.group_id` column
+
+**Context.** R2 (Retail: pricing and promotions) needs a customer to belong to a group so the group
+can map to a wholesale price list. The core already owns `contacts`, and the standing rule is that a
+vertical never edits a core table without an ADR.
+
+**Decision.** Extend `contacts` additively with one nullable column, `group_id uuid`, plus a
+composite foreign key `(org_id, group_id) -> customer_groups (org_id, id) on delete set null`. The
+column is nullable, so every existing row and every core code path is unaffected; a contact with no
+group simply resolves at the retail price list. All of R2's own tables (`price_lists`,
+`price_list_items`, `customer_groups`, `promotions`, `discount_limits`, `manual_discounts`) are new,
+so nothing else in the core is touched.
+
+**Consequence.** `docs/CORE_INTERFACE.md` records the addition. A later vertical that needs more
+customer attributes should prefer its own table keyed on `contact_id`, and must write its own ADR
+before adding another column to `contacts`.
+
+## ADR-0012 — Promotion candidates are cached in Redis, never prices
+
+**Context.** Pricing must read the org's active promotions on every cart. That is a small read but a
+hot one, and the brief allows Redis for the promotion cache. The risk of any cache is serving a
+value that the ledger no longer agrees with: a promotion that has been deactivated, or whose window
+has closed, must not keep applying.
+
+**Decision.** Redis holds the *candidate* list only (id, type, priority, stackable, validity window,
+conditions), under the key `promos:{org_id}` with a 300-second TTL. It never holds a resolved price.
+Every evaluation re-checks the validity window against the caller's timestamp inside
+`app.apply_promotions`, which is the single implementation used by both the cached path and the SQL
+path. A write to `promotions` invalidates the key, but correctness does not depend on invalidation:
+a stale entry that still names an expired promotion is filtered out at evaluation time. The cache is
+therefore rebuildable from the immutable source at any moment, and losing it only costs one read.
+
+**Consequence.** `tests/retail-r2.test.ts` writes a real Redis key with a real 300s TTL containing an
+expired promotion and asserts the price is still the full list price. Redis is not a source of
+truth, so no posting path reads it.
+
+## ADR-0013 — Pricing precedence is enforced in one SQL function
+
+**Context.** Precedence is: the customer group's price list (falling back to the retail list), then
+active promotions by priority, then a manual discount for a role that is allowed one. If the till,
+the cart API and any future channel each implement this, they will drift.
+
+**Decision.** `app.get_price` (single variant) and `app.get_prices` (batched cart) own the ordering,
+and `app.apply_promotions` owns the promotion rules (highest priority is the primary; further
+promotions apply only when both it and the primary are stackable). `app.assert_manual_discount` owns
+the manual-discount cap and the reason requirement. The TypeScript layer only marshals input and
+formats output. Both pricing functions are `language sql`, `security invoker`, with no
+`set search_path` clause, so the planner can inline them and use the `price_list_items` index.
+
+**Consequence.** A cart of N items costs one batched query (plus, on a cold cache, one candidates
+read), never N. `tests/retail-r2.test.ts` counts the round trips and asserts `EXPLAIN` shows
+`price_list_items_list_variant_key`.

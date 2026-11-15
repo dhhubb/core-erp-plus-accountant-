@@ -18,7 +18,9 @@ with tenant_tables as (
       'stock_layer_balances', 'stock_transfers', 'journals', 'journal_lines',
       'sales_orders', 'invoices', 'invoice_lines', 'payments', 'credit_notes',
       'purchase_orders', 'audit_logs',
-      'categories', 'product_batches'
+      'categories', 'product_batches',
+      'price_lists', 'price_list_items', 'customer_groups', 'promotions',
+      'discount_limits', 'manual_discounts'
     )
 ),
 cols as (

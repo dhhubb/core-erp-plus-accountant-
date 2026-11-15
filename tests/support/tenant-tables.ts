@@ -46,6 +46,13 @@ export const TENANT_TABLES: TenantTable[] = [
   // R1 (retail): products, barcodes and search.
   { name: 'categories', scope: 'org', highVolume: false, partitioned: false },
   { name: 'product_batches', scope: 'org', highVolume: false, partitioned: false },
+  // R2 (retail): pricing and promotions.
+  { name: 'price_lists', scope: 'org', highVolume: false, partitioned: false },
+  { name: 'price_list_items', scope: 'org', highVolume: false, partitioned: false },
+  { name: 'customer_groups', scope: 'org', highVolume: false, partitioned: false },
+  { name: 'promotions', scope: 'org', highVolume: false, partitioned: false },
+  { name: 'discount_limits', scope: 'org', highVolume: false, partitioned: false },
+  { name: 'manual_discounts', scope: 'branch', highVolume: true, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -292,6 +299,46 @@ export async function seedOneRowPerTenantTable(
     `insert into public.product_batches (org_id, variant_id, batch_no, expiry_date)
      values ($1, (select id from public.product_variants where org_id = $1 limit 1), $2, date '2030-01-01')`,
     [orgId, `BATCH-${randomUUID().slice(0, 8)}`],
+  );
+
+  // R2 (retail): pricing and promotions.
+  const retailList = await sql<{ id: string }>(
+    `insert into public.price_lists (org_id, name, kind)
+     values ($1, 'Retail', 'retail') returning id`,
+    [orgId],
+  );
+  const retailListId = retailList[0]!.id;
+
+  await sql(
+    `insert into public.price_list_items (org_id, price_list_id, variant_id, price)
+     values ($1, $2, (select id from public.product_variants where org_id = $1 limit 1), 10.0000)`,
+    [orgId, retailListId],
+  );
+
+  await sql(
+    `insert into public.customer_groups (org_id, name, price_list_id)
+     values ($1, 'Seed Group', $2)`,
+    [orgId, retailListId],
+  );
+
+  await sql(
+    `insert into public.promotions (org_id, name, type, valid_from, valid_to, conditions)
+     values ($1, 'Seed Promo', 'percent', now() - interval '1 day', now() + interval '1 day',
+             '{"value": 5}'::jsonb)`,
+    [orgId],
+  );
+
+  await sql(
+    `insert into public.discount_limits (org_id, role, max_percent)
+     values ($1, 'member', 5.0000)`,
+    [orgId],
+  );
+
+  await sql(
+    `insert into public.manual_discounts
+       (org_id, branch_id, invoice_id, line_no, role, amount, reason)
+     values ($1, $2, $3, 1, 'member', 1.0000, 'Seed discount')`,
+    [orgId, branchId, invoiceId],
   );
 
   return {

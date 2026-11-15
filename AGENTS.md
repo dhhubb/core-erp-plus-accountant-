@@ -26,6 +26,7 @@ No Prisma. Schema lives in plain SQL migrations under `supabase/migrations/`.
 
 ```bash
 supabase start                 # local Postgres + Auth (Docker must be running)
+redis-server --daemonize yes   # R2 tests need a real Redis (REDIS_URL, default :6379)
 supabase db reset              # apply every migration to an empty database
 npm test                       # all tests, against real Postgres
 npm run build                  # next build
@@ -55,8 +56,18 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
   asserting an `EXPLAIN` shows the index.
 * **`delete` + reinsert bloats a table and makes the planner flip-flop.** Use a fresh table, or
   `vacuum analyze`, when probing plan choices.
+* **`ANALYZE` on a shared table leaks across test files.** Re-analysing `products` in one file
+  changed the planner for the R1 search test in another. Seed and analyse only the table under
+  test; keep the shared-table statistics untouched.
+* **R2 caches promotion candidates, never prices.** Redis key `promos:{org_id}`, TTL 300s. Every
+  evaluation re-checks the validity window in SQL (`app.apply_promotions`), so a stale entry cannot
+  apply an expired promotion. A write to `promotions` invalidates the key, but correctness does not
+  depend on it.
+* **`language sql` pricing functions must have no `set search_path` clause**, or they will not
+  inline and `EXPLAIN` will not show `price_list_items_list_variant_key`.
 
 ## Test numbering
 
-Phase 1 owns 1–40. R1 owns 41–44 (`tests/retail-r1.test.ts`). A new run continues from the highest
-number actually present; ranges in `docs/phase2/README.md` are indicative only (ADR-0010).
+Phase 1 owns 1–40. R1 owns 41–44 (`tests/retail-r1.test.ts`). R2 owns 45–48
+(`tests/retail-r2.test.ts`). A new run continues from the highest number actually present; ranges in
+`docs/phase2/README.md` are indicative only (ADR-0010).

@@ -50,13 +50,14 @@ Membership changes take effect on token refresh, not before. This is documented 
 
 Org-scoped (no `branch_id`): `organizations`, `branches`, `memberships`, `invites`, `products`,
 `product_variants`, `contacts`, `chart_of_accounts`, `tax_rates`, `exchange_rates`,
-`fiscal_periods`, `number_series`, `settings`, and the R1 additions `categories` and
-`product_batches`.
+`fiscal_periods`, `number_series`, `settings`, the R1 additions `categories` and
+`product_batches`, and the R2 additions `price_lists`, `price_list_items`, `customer_groups`,
+`promotions`, `discount_limits`.
 
 Branch-scoped (also `branch_id`): `warehouses`, `stock_ledger`, `stock_consumptions`,
 `stock_balances`, `stock_layer_balances`, `stock_transfers`, `journals`, `journal_lines`,
 `sales_orders`, `invoices`, `invoice_lines`, `payments`, `credit_notes`, `purchase_orders`,
-`audit_logs`.
+`audit_logs`, and the R2 addition `manual_discounts`.
 
 Partitioned monthly on `created_at`: `journals`, `journal_lines`, `stock_ledger`,
 `stock_consumptions`, `audit_logs`. Their primary keys include `created_at`.
@@ -69,6 +70,7 @@ Partitioned monthly on `created_at`: `journals`, `journal_lines`, `stock_ledger`
 | `src/core/env.ts` | `databaseUrl`, `testDatabaseUrl`, `required`. |
 | `src/core/money.ts` | `money`, `moneyFromSql` (decimal.js). |
 | `src/core/sales.ts` | `createInvoice`, `listInvoices`, `DEFAULT_PAGE_LIMIT`, `MAX_PAGE_LIMIT`, `InvoiceLineInput`. |
+| `src/core/redis.ts` | `getRedis`, `closeRedis`, `redisUrl` (shared ioredis client; `REDIS_URL`, default `redis://127.0.0.1:6379`). |
 | `src/app/api/_lib.ts` | `withAuth`, `parseLimit`, `parseCursor` for thin handlers. |
 
 ## Vertical modules
@@ -88,3 +90,22 @@ Additive, recorded in ADR-0008. It does not change core accounting logic.
 * `app.search_products(org_id, query, limit)` — exact barcode first, then a trigram name match,
   backed by a `(org_id, name gin_trgm_ops)` GIN index. At most 20 rows.
 * `GET /api/pos/search?q=` and `src/verticals/retail/*`.
+
+## R2 extension (Retail: pricing and promotions)
+
+Additive, recorded in ADR-0011 to ADR-0013. It does not change core accounting logic; posting still
+reads the rate and tax it stores on the line.
+
+* New org-scoped tables: `price_lists` (one `retail`, one `wholesale` per org), `price_list_items`,
+  `customer_groups`, `promotions`, `discount_limits`.
+* New branch-scoped table: `manual_discounts` (every manual discount with its reason).
+* Additive core change: `contacts.group_id` (nullable, `(org_id, group_id)` foreign key).
+* `app.get_price(org_id, variant_id, group_id, at_time, qty, subtotal)` — one variant.
+* `app.get_prices(org_id, group_id, variant_ids, qtys, at_time, candidates)` — a batched cart.
+* `app.apply_promotions(...)`, `app.promotion_candidates(org_id)`, `app.assert_manual_discount(...)`,
+  `app.record_manual_discount(...)`, `app.convert_for_display(...)`.
+* Precedence: the customer group's price list (falling back to the retail list per item), then
+  active promotions by priority (stacking only when stackable), then a manual discount for a role
+  whose `discount_limits` row allows it and with a reason.
+* `POST /api/pos/price` and `src/verticals/retail/pricing.ts`. Redis caches promotion candidates
+  only (key `promos:{org_id}`, TTL 300s), never a resolved price.

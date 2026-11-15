@@ -4,7 +4,8 @@ Repo root: `/workspace/project`
 Stack: Next.js 14 (App Router) · TypeScript strict · Supabase (local Postgres 17 + Auth) · Vitest · `pg`
 Schema: plain SQL migrations in `supabase/migrations/` (no Prisma).
 
-Phase 1 (the core) is complete: tests 1–40. R1 extends the core additively: tests 41–44.
+Phase 1 (the core) is complete: tests 1–40. R1 extends the core additively: tests 41–44. R2 adds
+pricing and promotions: tests 45–48.
 
 ## Status
 
@@ -17,6 +18,7 @@ Phase 1 (the core) is complete: tests 1–40. R1 extends the core additively: te
 | M4 | Sales & purchases + concurrency | tests 32–40 | DONE |
 | M5 | Hardening (audit, checks, perf, README) | verification list | DONE |
 | R1 | Retail extension: products, barcodes, search | tests 41–44 | DONE |
+| R2 | Retail extension: pricing and promotions | tests 45–48 | DONE |
 
 ## M0 — Setup
 
@@ -297,3 +299,66 @@ Notes:
   `set search_path`, and a parenthesised `UNION ALL` instead of a CTE.
 * `docs/CORE_INTERFACE.md` was a stated starting condition but did not exist; it has been written
   from the Phase 1 migrations.
+
+## R2 — Retail extension: pricing and promotions
+
+Additive. The only core-table change is a nullable `contacts.group_id` (ADR-0011); no core
+accounting path is touched. See ADR-0011 to ADR-0013 and `docs/CORE_INTERFACE.md`.
+
+Migration: `supabase/migrations/20260101020000_retail_r2_pricing_promotions.sql`.
+
+* New org-scoped tables: `price_lists`, `price_list_items`, `customer_groups`, `promotions`,
+  `discount_limits`. New branch-scoped table: `manual_discounts`.
+* Additive column: `contacts.group_id uuid` with a `(org_id, group_id)` foreign key.
+* Functions: `app.get_price`, `app.get_prices`, `app.apply_promotions`,
+  `app.promotion_candidates`, `app.assert_manual_discount`, `app.record_manual_discount`,
+  `app.convert_for_display`.
+* TypeScript: `src/verticals/retail/pricing.ts`, `src/core/redis.ts`; route
+  `src/app/api/pos/price/route.ts`.
+* Redis caches promotion *candidates* only (`promos:{org_id}`, TTL 300s), never a resolved price.
+
+The 4 tests:
+
+| # | Test |
+|---|------|
+| 45 | Matching promotion applies automatically from cache |
+| 46 | Promotion past valid_to not applied, even when the cache entry is 3 minutes old |
+| 47 | Precedence holds, and a manual discount above the role limit is rejected |
+| 48 | A 30-item cart resolves prices in at most two database queries, and get_price uses an index |
+
+Gate evidence:
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  6 passed (6)
+      Tests  48 passed (48)
+
+$ npm run build
+ ✓ Compiled successfully
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ psql "$DATABASE_URL" -f scripts/check-fk-indexes.sql
+(0 rows)
+
+$ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+Notes:
+
+* Precedence is implemented once, in `app.apply_promotions` and `app.get_price(s)`, so the cached
+  path and the SQL path cannot drift. The cached path passes the Redis candidates into the same
+  function.
+* The retail list is a per-item fallback, not only a fallback when the group has no list: a variant
+  missing from the group's list prices at retail (test 47).
+* Both pricing functions are `language sql`, `security invoker`, with no `set search_path` clause,
+  so the planner inlines them and uses `price_list_items_list_variant_key` (test 48 asserts this).
+* Test 48 seeds 2,000 extra price rows and analyses only `price_list_items`; re-analysing the shared
+  `products` table perturbed the planner for the R1 search test.
+* Core test 9 drove extra indexes on the new composite foreign keys
+  (`price_list_items`, `customer_groups`, `contacts.group_id`, `manual_discounts`).
