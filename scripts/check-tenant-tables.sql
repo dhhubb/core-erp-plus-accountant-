@@ -22,7 +22,9 @@ with tenant_tables as (
       'price_lists', 'price_list_items', 'customer_groups', 'promotions',
       'discount_limits', 'manual_discounts',
       'shifts', 'pos_sales', 'pos_payments', 'pos_sale_keys',
-      'pos_sync_exceptions'
+      'pos_sync_exceptions',
+      'credit_limits', 'laybys', 'layby_reservations', 'returns', 'return_lines',
+      'z_reports', 'stock_counts', 'stock_count_items'
     )
 ),
 cols as (

@@ -334,3 +334,90 @@ backlog would strand money that has already changed hands. Only the live path is
 ledger is unaware of the limiter. Losing the Redis keys costs at most a fresh window; nothing
 durable lives there. `tests/pos-r4.test.ts` test 18 proves the 31st live sale is `429` while a
 100-sale backlog syncs with no `429`.
+
+## ADR-0019 — Operations post through a balanced-journal hook, and the core tables get additive changes
+
+**Context.** R5 (Operations) adds laybys, returns, credit limits, Z-reports and stock counts. Three
+of these move money: a layby deposit (Dr Bank, Cr Customer Deposits), a layby cancellation (Dr
+Customer Deposits, Cr Bank and Cr Fee Income) and a return refund (Dr AR, Cr Bank or Cr Store
+Credit). Every one of them must post a balanced journal, and the ledger must balance at commit.
+
+The brief names the hook `balanced-journal…` (the message was truncated). It also requires that an
+operational journal not be posted by calling `app.post_journal` ad hoc from each function, because
+a single mistyped line would only be caught at commit by the deferred trigger.
+
+**Decision.**
+
+1. **One hook.** `app.post_balanced_journal(org_id, branch_id, posting_date, source_type,
+   source_id, memo, currency, lines)` sums the debits and credits of the incoming lines, raises
+   `23514` with a clear message when they differ, and then delegates to `app.post_journal`. Every
+   operational journal goes through it. It is an *earlier* guard, not a replacement: the deferred
+   `journals` balance trigger still runs at commit.
+2. **Additive core changes** (all recorded here because they touch shared tables):
+   * `settings` gains `layby_deposit_percent`, `layby_cancellation_fee` and `return_refund_method`.
+   * Three new default accounts (`2300 Customer Deposits`, `2400 Store Credit`, `4600 Layby
+     Cancellation Fees`) and four new number series (`LAYBY`, `RETURN`, `Z_REPORT`,
+     `STOCK_COUNT`) are added to the org-creation triggers. Existing orgs keep what they have; this
+     phase creates orgs only through `app.create_org`.
+   * `journals.source_type` gains `layby_deposit`, `layby_cancellation` and `return_refund`;
+     `stock_ledger.source_type` gains `layby`.
+   * A new index `invoices (org_id, contact_id, created_at desc, id desc)` for the credit check's
+     open-balance sum and a customer's keyset invoice listing.
+3. **Z-reports are immutable.** `z_reports` is forced-RLS and passed through
+   `app.enforce_immutable`, like the ledger tables. It is the only thing a daily summary reads;
+   there is no materialized view and no running total on each sale.
+
+**Consequence.** Every operational journal is balanced by construction, and the deferred trigger
+remains the last line of defence. The additive changes are visible to any later phase. Re-creating
+`app.create_default_accounts` and `app.create_default_number_series` in the R5 migration is
+additive: the applied migrations are untouched and the newest definition wins.
+
+## ADR-0020 — Credit limits serialise on the contact row, not on the invoice sum
+
+**Context.** A credit limit must hold under concurrency: twenty simultaneous credit sales must not
+each read the same headroom and each pass. The naive check (`select sum(total - amount_paid) ...`
+then insert) is a classic read-then-write race, because two transactions can read the same sum
+before either writes.
+
+**Decision.** `app.check_credit` first takes `select ... from contacts where id = $contact for
+update`. That row lock serialises every credit check for one customer, so each transaction sees the
+sum the previous one committed. The check then compares `open + amount` against the ceiling and
+raises `23514` when it would exceed it. A customer with no `credit_limits` row has no ceiling and is
+allowed.
+
+**Consequence.** Credit checks for one customer are serialised (a deliberate cost: correctness over
+throughput for a single customer), while different customers never block each other. The lock order
+is the contact first, then stock, which is a different resource than the stock lock order, so no new
+deadlock cycle is introduced. `tests/ops-r5.test.ts` test 23 proves 20 concurrent 10-unit credit
+sales against a 100 ceiling leave exactly 10 committed and the open balance at exactly 100.
+
+## ADR-0021 — A layby reserves stock by consuming FIFO at creation; a stock count posts one journal
+
+**Context.** Two R5 operations touch stock in ways the core functions do not cover.
+
+A layby holds goods aside until collection, but the brief says a reservation is a *mutable
+operational row*, not a ledger row. Left as a pure reservation, the goods would still be sellable
+to someone else, and the layby could not be collected.
+
+A stock count produces one variance per line. The core `app.post_stock_adjustment` posts one journal
+per movement, so a 500-line count would post 500 journals, which is neither reviewable nor what the
+brief asks for.
+
+**Decision.**
+
+* **Layby reservation.** `app.create_layby` consumes the FIFO layers at creation, in the core's
+  ascending `(warehouse_id, product_id)` lock order, and records the reserved cost on
+  `layby_reservations`. The goods therefore leave the available pool immediately. Collection
+  (`app.complete_layby`) writes the invoice for the reserved goods at that reserved cost — it does
+  not call `app.create_invoice`, which would consume FIFO a second time. Cancellation
+  (`app.cancel_layby`) returns the stock as a new inbound layer at the reserved cost.
+* **One journal per count.** `app.close_stock_count` writes one ledger row per variance (a new
+  inbound layer for a surplus, a FIFO consumption for a shortfall) but posts a **single** journal
+  for the whole count: Dr/Cr Inventory against Dr/Cr Inventory Adjustment, aggregated over the
+  lines.
+
+**Consequence.** A layby's stock cannot be oversold while it is open, and a large stock count is one
+reviewable journal. The reservation is still an operational row: it is mutable (its `status` moves
+from `reserved` to `collected` or `released`), which is why it lives outside the immutable ledger
+and carries a mutable status rather than a reversing entry. `tests/ops-r5.test.ts` tests 19 to 21
+and 24 cover the deposit journal, collection, cancellation and the single count journal.

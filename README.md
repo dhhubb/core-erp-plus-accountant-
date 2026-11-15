@@ -27,6 +27,7 @@ migrations, and Prisma usually connects as a role that bypasses RLS.
 - [Retail extension (R2)](#retail-extension-r2)
 - [Retail extension (R3)](#retail-extension-r3)
 - [Retail extension (R4)](#retail-extension-r4)
+- [Retail extension (R5)](#retail-extension-r5)
 - [Adding a vertical module](#adding-a-vertical-module)
 - [Tests, checks and the perf run](#tests-checks-and-the-perf-run)
 
@@ -110,6 +111,21 @@ erDiagram
     organizations ||--o{ promotions : has
     organizations ||--o{ discount_limits : caps
 
+    organizations ||--o{ credit_limits : caps
+    contacts ||--o| credit_limits : limited_by
+    branches ||--o{ laybys : has
+    contacts ||--o{ laybys : places
+    laybys ||--|{ layby_reservations : reserves
+    laybys ||--o| invoices : collected_as
+    branches ||--o{ returns : has
+    invoices ||--o{ returns : returned_from
+    returns ||--|{ return_lines : contains
+    return_lines }o--|| invoice_lines : returns
+    branches ||--o{ z_reports : summarises
+    shifts ||--o| z_reports : closed_as
+    branches ||--o{ stock_counts : has
+    stock_counts ||--|{ stock_count_items : counts
+
     organizations {
         uuid id PK
         uuid org_id
@@ -183,6 +199,56 @@ erDiagram
         text table_name
         uuid record_id
         text action
+    }
+    laybys {
+        uuid id PK
+        uuid org_id FK
+        uuid branch_id FK
+        uuid contact_id FK
+        text layby_no
+        text status
+        date due_date
+        numeric total
+        numeric deposit_paid
+        numeric cancellation_fee
+    }
+    layby_reservations {
+        uuid id PK
+        uuid org_id FK
+        uuid branch_id FK
+        uuid layby_id FK
+        uuid product_id FK
+        numeric qty
+        numeric unit_cost
+        text status
+    }
+    returns {
+        uuid id PK
+        uuid org_id FK
+        uuid branch_id FK
+        uuid original_invoice_id FK
+        text return_no
+        text refund_method
+        numeric total
+    }
+    z_reports {
+        uuid id PK
+        uuid org_id FK
+        uuid branch_id FK
+        uuid shift_id FK
+        text z_no
+        numeric gross_sales
+        numeric tax_total
+        jsonb vat_by_rate
+    }
+    stock_counts {
+        uuid id PK
+        timestamptz created_at PK
+        uuid org_id FK
+        uuid branch_id FK
+        uuid warehouse_id FK
+        text count_no
+        text status
     }
 ```
 
@@ -445,6 +511,38 @@ core functions with a hook. See ADR-0015, ADR-0016, ADR-0017 and ADR-0018.
 - **Endpoints.** `POST /api/pos/sync` delivers a backlog; `POST /api/pos/sales` gains the limiter.
   The `/pos` page shows `Pending n` and drains the outbox on load, on reconnect and every 15s.
 
+## Retail extension (R5)
+
+R5 adds the back-office operations the till needs. It is additive: new tables, new functions, and
+three additive changes to core tables. See ADR-0019, ADR-0020 and ADR-0021.
+
+- **Laybys** (`laybys`, `layby_reservations`). A layby reserves goods by consuming the FIFO layers
+  at creation, so they leave the available pool immediately; the reserved cost is kept on
+  `layby_reservations`. The deposit posts through the balanced-journal hook as Dr Bank, Cr Customer
+  Deposits — no revenue is recognised until collection. Collection writes the invoice for the
+  reserved goods at the reserved cost and clears the deposit against AR. Cancellation returns the
+  stock as a new inbound layer and posts Dr Customer Deposits, Cr Bank (refund), Cr Fee Income (the
+  cancellation fee, from `settings.layby_cancellation_fee` or an override). Index
+  `(org_id, branch_id, status, due_date)`.
+- **Returns** (`returns`, `return_lines`). `app.create_return` locks the original invoice lines in
+  order, refuses a return beyond the unreturned quantity, calls the core credit note for stock and
+  revenue, and posts the refund through the balanced-journal hook (Cr Bank or Cr Store Credit, per
+  `settings.return_refund_method`).
+- **Credit limits** (`credit_limits`). `app.check_credit` locks the contact row `FOR UPDATE` and
+  refuses a sale that would push the open balance past the ceiling. Concurrent checks serialise on
+  that lock, so 20 simultaneous sales against one ceiling cannot each read the same headroom.
+- **Z-reports** (`z_reports`, immutable). `app.close_shift` writes exactly one Z-report per closed
+  shift — sale and void counts, gross sales, VAT, tenders by method and currency, VAT by rate. It is
+  the only thing a daily summary reads; there is no materialized view and no running total on each
+  sale.
+- **Stock counts** (`stock_counts`, partitioned monthly, `stock_count_items`). A count snapshots the
+  system quantity; the counted lines are imported with `COPY FROM STDIN`. Closing it posts **one**
+  core stock adjustment (one journal) for the whole count, with one ledger row per variance.
+- **Endpoints.** `GET/POST /api/laybys` (create, `action: 'complete'`, `action: 'cancel'`),
+  `GET/POST /api/returns`, `GET/POST /api/credit-limits`, `GET/POST /api/stock-counts`
+  (`action: 'lines'`, `action: 'close'`), `GET/POST /api/z-reports`. Modules under
+  `src/verticals/ops/`.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -454,7 +552,9 @@ table without an ADR.
    `supabase/migrations/<timestamp>_pharmacy_*.sql` for its own tables.
 2. Depend only on core functions: `app.post_journal`, `app.post_receipt`, `app.create_invoice`,
    `app.allocate_payment`, `app.create_credit_note`, `app.post_stock_adjustment`,
-   `app.next_number`, `app.ensure_partitions`. Call them, do not reimplement them. A pricing-aware
+   `app.next_number`, `app.ensure_partitions`. Call them, do not reimplement them. An operational
+   journal goes through `app.post_balanced_journal` rather than `app.post_journal` directly, so it
+   is balanced by construction (ADR-0019). A pricing-aware
    vertical also uses `app.get_price`, `app.get_prices`, `app.apply_promotions` and
    `app.assert_manual_discount` rather than its own copy of the precedence rules.
 3. Scope every new table by `org_id` (and `branch_id` when it is branch-scoped), and apply the same

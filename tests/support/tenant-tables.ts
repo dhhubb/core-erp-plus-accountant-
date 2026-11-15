@@ -60,6 +60,15 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'pos_sale_keys', scope: 'org', highVolume: false, partitioned: false },
   // R4 (retail): offline outbox and sync.
   { name: 'pos_sync_exceptions', scope: 'branch', highVolume: true, partitioned: false },
+  // R5 (operations): laybys, returns, credit limits, z-reports, stock counts.
+  { name: 'credit_limits', scope: 'org', highVolume: false, partitioned: false },
+  { name: 'laybys', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'layby_reservations', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'returns', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'return_lines', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'z_reports', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'stock_counts', scope: 'branch', highVolume: true, partitioned: true },
+  { name: 'stock_count_items', scope: 'branch', highVolume: true, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -385,6 +394,71 @@ export async function seedOneRowPerTenantTable(
     `insert into public.pos_sync_exceptions (org_id, branch_id, client_sale_id, kind, detail)
      values ($1, $2, $3, 'negative_stock', '{"reason": "seed"}'::jsonb)`,
     [orgId, branchId, randomUUID()],
+  );
+
+  // R5 (operations): laybys, returns, credit limits, z-reports, stock counts.
+  await sql(
+    `insert into public.credit_limits (org_id, contact_id, credit_limit)
+     values ($1, $2, 1000.0000)`,
+    [orgId, contactId],
+  );
+
+  const layby = await sql<{ id: string }>(
+    `insert into public.laybys
+       (org_id, branch_id, contact_id, warehouse_id, layby_no, due_date, subtotal, tax_total,
+        total, deposit_paid)
+     values ($1, $2, $3, $4, $5, current_date + 30, 10, 1.5, 11.5, 2) returning id`,
+    [orgId, branchId, contactId, warehouseId, `SEED-LB-${randomUUID().slice(0, 8)}`],
+  );
+  const laybyId = layby[0]!.id;
+
+  await sql(
+    `insert into public.layby_reservations
+       (org_id, branch_id, layby_id, product_id, warehouse_id, line_no, qty, unit_price, unit_cost,
+        tax_rate)
+     values ($1, $2, $3, $4, $5, 1, 1, 10, 5, 0.15)`,
+    [orgId, branchId, laybyId, productId, warehouseId],
+  );
+
+  const ret = await sql<{ id: string }>(
+    `insert into public.returns
+       (org_id, branch_id, original_invoice_id, contact_id, return_no, refund_method, total)
+     values ($1, $2, $3, $4, $5, 'cash', 1) returning id`,
+    [orgId, branchId, invoiceId, contactId, `SEED-RT-${randomUUID().slice(0, 8)}`],
+  );
+  const returnId = ret[0]!.id;
+
+  await sql(
+    `insert into public.return_lines
+       (org_id, branch_id, return_id, invoice_line_id, line_no, qty, unit_price, unit_cost)
+     select $1, $2, $3, il.id, 1, 1, 1, 1
+       from public.invoice_lines il where il.invoice_id = $4 limit 1`,
+    [orgId, branchId, returnId, invoiceId],
+  );
+
+  await sql(
+    `insert into public.z_reports
+       (org_id, branch_id, shift_id, z_no, opened_at, closed_at, opening_float, sale_count,
+        void_count, gross_sales, tax_total, by_method, by_currency, vat_by_rate)
+     values ($1, $2, $3, $4, now() - interval '1 hour', now(), 0, 1, 0, 1, 0, '{}', '{}', '{}')`,
+    [orgId, branchId, shiftId, `SEED-Z-${randomUUID().slice(0, 8)}`],
+  );
+
+  const count = await sql<{ id: string; created_at: string }>(
+    `insert into public.stock_counts (org_id, branch_id, warehouse_id, count_no, counted_at)
+     values ($1, $2, $3, $4, current_date)
+     returning id, created_at::text as created_at`,
+    [orgId, branchId, warehouseId, `SEED-SC-${randomUUID().slice(0, 8)}`],
+  );
+  const countId = count[0]!.id;
+  const countCreatedAt = count[0]!.created_at;
+
+  await sql(
+    `insert into public.stock_count_items
+       (org_id, branch_id, count_id, count_created_at, line_no, product_id, counted_qty,
+        system_qty, unit_cost)
+     values ($1, $2, $3, $4, 1, $5, 9, 9, 1)`,
+    [orgId, branchId, countId, countCreatedAt, productId],
   );
 
   return {

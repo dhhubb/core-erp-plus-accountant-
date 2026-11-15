@@ -57,7 +57,11 @@ export function toErrorResponse(error: unknown): NextResponse {
     return jsonError(401, 'unauthorized');
   }
   // A SQL guard raised an exception (e.g. insufficient stock, limit out of range).
-  if (/insufficient stock|must be between|exceeds open balance|is closed|append-only/i.test(message)) {
+  if (
+    /insufficient stock|must be between|exceeds open balance|is closed|append-only|credit limit exceeded|exceeds the .* sold|is not open|is already closed|cancellation fee|deposit|does not equal credits/i.test(
+      message,
+    )
+  ) {
     return jsonError(422, message);
   }
   return jsonError(500, 'internal error');

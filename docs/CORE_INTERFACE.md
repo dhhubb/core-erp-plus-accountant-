@@ -151,3 +151,35 @@ synced sale still calls the core invoice and payment functions.
 * The live sale endpoint `POST /api/pos/sales` is rate limited to 30 sales/minute/cashier and
   returns `429` with `Retry-After` past that. `POST /api/pos/sync` is exempt, so a backlog is never
   throttled. Redis holds counters only; the ledger is unaffected.
+
+## R5 extension (Retail: operations)
+
+Additive, recorded in ADR-0019, ADR-0020 and ADR-0021. It does not change core accounting logic;
+the operational rows are mutable, and the only money that moves is posted through the core posting
+functions.
+
+* New org-scoped table: `credit_limits` (one ceiling per customer).
+* New branch-scoped tables: `laybys`, `layby_reservations`, `returns`, `return_lines`, `z_reports`
+  (immutable), `stock_counts` (partitioned monthly, PK `(id, created_at)`), `stock_count_items`.
+* `app.post_balanced_journal(...)` — the balanced-journal hook. An operational journal (a layby
+  deposit, a layby cancellation, a return refund) goes through this, not `app.post_journal`
+  directly. It asserts the lines balance before delegating, then `app.post_journal` posts.
+* `app.check_credit(org_id, contact_id, amount)` — locks the contact `FOR UPDATE`, then refuses a
+  sale that would push the open balance past the ceiling. Concurrent checks serialise on the lock.
+* `app.create_layby(...)` — reserves the goods (FIFO, so they leave the available pool) and posts
+  Dr Bank / Cr Customer Deposits. No revenue yet.
+* `app.complete_layby(...)` — writes the invoice for the reserved goods at the reserved cost and
+  clears the deposit against AR. It does not call `app.create_invoice` (that would consume FIFO a
+  second time).
+* `app.cancel_layby(...)` — returns the reserved stock and posts Dr Customer Deposits, Cr Bank
+  (refund), Cr Fee Income (the cancellation fee).
+* `app.create_return(...)` — locks the original invoice lines in order, checks the unreturned
+  quantity, calls `app.create_credit_note` for stock and revenue, and posts the refund (Cr Bank or
+  Cr Store Credit).
+* `app.close_shift(org_id, shift_id, closed_by)` — re-created from R3 with the same signature; it
+  now also writes exactly one immutable `z_reports` row from the shift's sales and tenders.
+* `app.create_stock_count(...)`, `app.close_stock_count(...)` — a count snapshots the system
+  quantity; closing it posts one core stock adjustment (one journal) for the whole count.
+* `GET/POST /api/laybys`, `/api/returns`, `/api/credit-limits`, `/api/stock-counts`, `/api/z-reports`
+  and `src/verticals/ops/*` (`laybys.ts`, `returns.ts`, `credit.ts`, `stockCounts.ts`,
+  `zReports.ts`).

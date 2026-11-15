@@ -21,6 +21,7 @@ pricing and promotions: tests 45–48.
 | R2 | Retail extension: pricing and promotions | tests 45–48 | DONE |
 | R3 | Retail extension: online POS sale | tests 9–13 | DONE |
 | R4 | Retail extension: offline outbox and sync | tests 14–18 | DONE |
+| R5 | Retail extension: operations (laybys, returns, credit, Z-reports, stock counts) | tests 19–24 | DONE |
 
 ## M0 — Setup
 
@@ -508,3 +509,89 @@ Notes:
   IndexedDB API, not a stub of `outbox.ts`. The outbox module and the route handlers run for real.
 * Redis counters are prefixed `ratelimit:livesale:{org_id}:{branch_id}:{cashier_id}:{window}`. Redis
   holds counters only; the ledger is unaffected and the counters are safe to lose.
+
+## R5 — Retail extension: operations
+
+Scope: laybys, returns, credit limits, Z-reports and stock counts. Additive: new tables and
+functions, plus three additive changes to core tables (ADR-0019).
+
+Migration: `supabase/migrations/20260101050000_ops_r5.sql`.
+
+New tables:
+
+* Org-scoped: `credit_limits`.
+* Branch-scoped: `laybys` (index `(org_id, branch_id, status, due_date)`), `layby_reservations`,
+  `returns`, `return_lines`, `z_reports` (immutable), `stock_counts` (partitioned monthly, PK
+  `(id, created_at)`), `stock_count_items`.
+
+New SQL functions (all in `app`):
+
+* `post_balanced_journal` — the balanced-journal hook. Asserts the lines balance, then delegates to
+  `app.post_journal`. Every operational journal goes through it.
+* `check_credit` — locks the contact `FOR UPDATE`, then refuses a sale past the ceiling.
+* `create_layby` / `complete_layby` / `cancel_layby`.
+* `create_return` — locks the invoice lines, checks the unreturned quantity, calls the core credit
+  note, posts the refund.
+* `close_shift` — re-created from R3 with the same signature; now writes one immutable Z-report.
+* `create_stock_count` / `close_stock_count` — one core stock adjustment (one journal) per count.
+
+Additive core changes (ADR-0019):
+
+* `settings` gains `layby_deposit_percent`, `layby_cancellation_fee`, `return_refund_method`.
+* New default accounts `2300`, `2400`, `4600` and number series `LAYBY`, `RETURN`, `Z_REPORT`,
+  `STOCK_COUNT`.
+* `journals.source_type` gains `layby_deposit`, `layby_cancellation`, `return_refund`;
+  `stock_ledger.source_type` gains `layby`.
+* New index `invoices (org_id, contact_id, created_at desc, id desc)`.
+
+TypeScript: `src/verticals/ops/{laybys,returns,credit,stockCounts,zReports}.ts`, and thin handlers
+`src/app/api/{laybys,returns,credit-limits,stock-counts,z-reports}/route.ts`.
+
+The R5 tests (19–24):
+
+| # | Test |
+| --- | --- |
+| 19 | A layby deposit posts Dr Bank / Cr Customer Deposits and holds the stock aside |
+| 20 | Completing a layby creates the invoice and clears the deposit against AR |
+| 21 | Cancelling a layby refunds the deposit less the fee and returns the stock |
+| 22 | A return cannot exceed the quantity sold and returns stock at the original FIFO cost |
+| 23 | 20 concurrent credit sales against one customer never exceed the ceiling |
+| 24 | Closing a stock count posts one balanced journal, and closing a shift writes one Z-report |
+
+Gate evidence (R5):
+
+```
+$ supabase db reset
+Applying migration 20260101050000_ops_r5.sql...
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  9 passed (9)
+      Tests  65 passed (65)
+
+$ npm run build
+ ✓ Compiled successfully
+ ✓ Generating static pages (5/5)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ psql "$DATABASE_URL" -f scripts/check-fk-indexes.sql
+(0 rows)
+
+$ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+Notes:
+
+* `credit_limits`, `laybys`, `layby_reservations`, `returns`, `return_lines`, `z_reports`,
+  `stock_counts` and `stock_count_items` are registered in `tests/support/tenant-tables.ts` and
+  `scripts/check-tenant-tables.sql`, so the table-driven RLS test (test 2) and the schema checks
+  cover them without a special case.
+* `app.close_shift` changes its return type from `void` to `uuid`, so the R5 migration drops the R3
+  definition first (`drop function if exists app.close_shift(uuid, uuid, uuid)`) and re-creates it
+  with the same signature; the grant is re-issued. No R3 caller needed updating.
+* The `jsonb` payloads returned by the operations functions carry money as JSON numbers, so the
+  tests read money from the ledger columns (`NUMERIC`), not from the payload. The route handlers
+  format the payload values with `toFixed(4)`.

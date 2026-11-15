@@ -80,10 +80,34 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
   carries state).
 * **The sync endpoint is exempt from the rate limiter.** `POST /api/pos/sales` is limited per
   cashier; `POST /api/pos/sync` is not, so a backlog is never throttled away.
+* **`create or replace function` cannot change a return type.** R5 re-creates `app.close_shift`
+  with the same `(uuid, uuid, uuid)` signature but returns `uuid` instead of `void`, so the R5
+  migration does `drop function if exists app.close_shift(uuid, uuid, uuid)` first, then
+  re-creates it, then re-issues the grant. Overloading with an extra defaulted argument would make
+  an uncast call ambiguous (`function ... is not unique`).
+* **A jsonb payload carries money as a JSON number, not a fixed-scale string.** `select
+  app.create_layby(...)` returns `total` as the number `23`, not `"23.0000"`. Read money from the
+  ledger columns (which are `NUMERIC` and come back as strings) in a test, and format payload
+  values with `toFixed(4)` in a route handler.
+* **A partitioned parent's CHECK constraint covers its partitions.** R5 widens
+  `journals.source_type` and `stock_ledger.source_type` with `alter table ... drop constraint` then
+  `add constraint` on the parent; existing and future partitions inherit it.
+* **Operations post through `app.post_balanced_journal`, not `app.post_journal` directly.** The
+  hook asserts the lines balance before delegating, so an operational bug is caught at the call
+  site; the deferred commit trigger still runs as the last line of defence (ADR-0019).
+* **Credit checks lock the contact row.** `app.check_credit` takes `select ... from contacts ...
+  for update` first, so concurrent checks for one customer serialise and cannot each read the same
+  headroom (ADR-0020). The lock order is contact then stock.
+* **A stock count posts one journal, not one per line.** `app.close_stock_count` writes one ledger
+  row per variance but a single aggregated journal (ADR-0021).
+* **`COPY FROM STDIN` needs a real stream.** `pg-copy-streams` `from(sql)` returns a writable
+  stream; pipe a `Readable` into it and wait for `finish`. It is the import path for stock count
+  lines.
 
 ## Test numbering
 
 Phase 1 owns 1–40. R1 owns 41–44 (`tests/retail-r1.test.ts`). R2 owns 45–48
 (`tests/retail-r2.test.ts`). R3 owns 9–13 (`tests/pos-r3.test.ts` plus the keyboard e2e). R4 owns
-14–18 (`tests/pos-r4.test.ts` plus the offline e2e). A new run continues from the highest number
-actually present; ranges in `docs/phase2/README.md` are indicative only (ADR-0010).
+14–18 (`tests/pos-r4.test.ts` plus the offline e2e). R5 owns 19–24 (`tests/ops-r5.test.ts`). A new
+run continues from the highest number actually present; ranges in `docs/phase2/README.md` are
+indicative only (ADR-0010).
