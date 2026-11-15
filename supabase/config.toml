@@ -43,6 +43,9 @@ major_version = 17
 # OrioleDB version to use as the Postgres storage engine. Leave empty to use the default engine.
 orioledb_version = ""
 
+[db.settings]
+max_connections = 300
+
 [db.pooler]
 enabled = false
 # Port to use for the local connection pooler.
