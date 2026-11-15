@@ -53,6 +53,11 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'promotions', scope: 'org', highVolume: false, partitioned: false },
   { name: 'discount_limits', scope: 'org', highVolume: false, partitioned: false },
   { name: 'manual_discounts', scope: 'branch', highVolume: true, partitioned: false },
+  // R3 (retail): online POS sale.
+  { name: 'shifts', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'pos_sales', scope: 'branch', highVolume: true, partitioned: true },
+  { name: 'pos_payments', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'pos_sale_keys', scope: 'org', highVolume: false, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -339,6 +344,38 @@ export async function seedOneRowPerTenantTable(
        (org_id, branch_id, invoice_id, line_no, role, amount, reason)
      values ($1, $2, $3, 1, 'member', 1.0000, 'Seed discount')`,
     [orgId, branchId, invoiceId],
+  );
+
+  // R3 (retail): online POS sale.
+  const shift = await sql<{ id: string }>(
+    `insert into public.shifts (org_id, branch_id, till_id, opening_float)
+     values ($1, $2, $3, 0) returning id`,
+    [orgId, branchId, `TILL-${randomUUID().slice(0, 8)}`],
+  );
+  const shiftId = shift[0]!.id;
+
+  await sql(
+    `insert into public.pos_sales
+       (org_id, branch_id, shift_id, invoice_id, client_sale_id, status)
+     values ($1, $2, $3, $4, $5, 'completed')`,
+    [orgId, branchId, shiftId, invoiceId, randomUUID()],
+  );
+
+  await sql(
+    `insert into public.pos_sale_keys (org_id, client_sale_id)
+     values ($1, $2)`,
+    [orgId, randomUUID()],
+  );
+
+  await sql(
+    `insert into public.pos_payments
+       (org_id, branch_id, sale_id, sale_created_at, method, currency, amount_tendered,
+        amount_applied, rate, base_amount, change_given)
+     select $1, $2, ps.id, ps.created_at, 'cash', 'USD', 1, 1, 1, 1, 0
+       from public.pos_sales ps
+      where ps.org_id = $1
+      limit 1`,
+    [orgId, branchId],
   );
 
   return {

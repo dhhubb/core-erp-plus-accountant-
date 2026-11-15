@@ -19,6 +19,7 @@ pricing and promotions: tests 45–48.
 | M5 | Hardening (audit, checks, perf, README) | verification list | DONE |
 | R1 | Retail extension: products, barcodes, search | tests 41–44 | DONE |
 | R2 | Retail extension: pricing and promotions | tests 45–48 | DONE |
+| R3 | Retail extension: online POS sale | tests 9–13 | DONE |
 
 ## M0 — Setup
 
@@ -362,3 +363,68 @@ Notes:
   `products` table perturbed the planner for the R1 search test.
 * Core test 9 drove extra indexes on the new composite foreign keys
   (`price_list_items`, `customer_groups`, `contacts.group_id`, `manual_discounts`).
+
+## R3 — Retail extension: online POS sale
+
+Status: complete. Gate evidence below.
+
+What shipped:
+
+* `supabase/migrations/20260101030000_pos_r3_shifts_sales.sql` — `shifts` (org + branch scoped,
+  `till_id`, `opened_at`, `closed_at`, `opening_float`, index `(org_id, branch_id, till_id,
+  opened_at desc)`); `pos_sales` (partitioned monthly on `created_at`, PK `(id, created_at)`,
+  indexes `(org_id, branch_id, created_at desc, id desc)` and `(org_id, branch_id, shift_id)`);
+  `pos_payments` (one row per tender, composite FK to `pos_sales (id, created_at)`); `pos_sale_keys`
+  (the idempotency claim, `unique (org_id, client_sale_id)` — ADR-0014). RLS forced on all four.
+* `app.post_pos_sale` — one transaction: resolve lines, price via R2, `app.create_invoice`,
+  one `app.allocate_payment` per tender, write `pos_sales` and `pos_payments`. Idempotent on
+  `client_sale_id`. `app.open_shift` and `app.list_pos_sales` alongside it.
+* `src/verticals/pos/` — `sales.ts` (typed wrappers), `cart.ts` (Zustand cart, decimal money),
+  `api.ts` (bearer-token fetch). `src/app/api/pos/sales` and `src/app/api/pos/shifts` thin routes.
+* `/pos` keyboard-only till, 58mm browser receipt, `docs/pos-keys.md`.
+
+Gate evidence:
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  7 passed (7)
+      Tests  54 passed (54)
+
+$ npx playwright test
+  1 passed (2.2s)
+
+$ npm run build
+ ✓ Compiled successfully
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ psql "$DATABASE_URL" -f scripts/check-fk-indexes.sql
+(0 rows)
+
+$ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+The R3 tests (9–13):
+
+| # | Test |
+| --- | --- |
+| 9 | Sale creates one invoice, one payment and one pos_payments row, and the journal balances to 0.0000 |
+| 10 | 50 concurrent sales for 10 units: exactly 10 succeed, 40 fail with insufficient stock, stock lands on 0.0000 |
+| 11 | A USD + ZWG sale creates 2 pos_payments rows and 2 core payments, and the invoice is fully paid |
+| 12 | 100 concurrent sales across shared products in one branch finish with no non-retryable error and no negative stock |
+| 13 | One-item exact cash sale completes in three keyboard-only actions (Playwright) |
+
+Notes:
+
+* `pos_sales` is partitioned monthly, so `unique (org_id, client_sale_id)` cannot sit on it
+  (Postgres requires the partition key in every unique constraint). The claim lives on
+  `pos_sale_keys`; the retry path returns the original receipt. ADR-0014.
+* The till resolves the price for a scanned item through `POST /api/pos/price` before adding it, so
+  the F9 exact-cash tender equals the invoice total to the cent.
+* `shifts` and `pos_payments` carry the `(org_id, branch_id, created_at desc, id desc)` index so the
+  schema invariants (test 11) cover them without a special case.

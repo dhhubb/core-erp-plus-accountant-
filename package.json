@@ -10,7 +10,8 @@
     "test": "vitest run --reporter=verbose",
     "test:perf": "tsx scripts/perf.ts",
     "db:reset": "supabase db reset",
-    "db:status": "supabase status"
+    "db:status": "supabase status",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "decimal.js": "^10.4.3",
@@ -18,9 +19,11 @@
     "next": "14.2.15",
     "pg": "^8.13.1",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "zustand": "^5.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "@types/node": "^20.16.11",
     "@types/pg": "^8.11.10",
     "@types/react": "^18.3.11",

@@ -149,10 +149,11 @@ export async function postReceipt(
   qty: number | string,
   unitCost: number | string,
   postingDate = '2026-06-15',
+  variantId: string | null = null,
 ): Promise<string> {
   const row = await one<{ app: string }>(
-    `select app.post_receipt($1, $2, $3, $4, null, $5, $6, $7::date) as app`,
-    [tenant.orgId, tenant.branchId, warehouseId, productId, qty, unitCost, postingDate],
+    `select app.post_receipt($1, $2, $3, $4, $5, $6, $7, $8::date) as app`,
+    [tenant.orgId, tenant.branchId, warehouseId, productId, variantId, qty, unitCost, postingDate],
   );
   return row!.app;
 }

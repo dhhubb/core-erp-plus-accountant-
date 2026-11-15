@@ -20,7 +20,8 @@ with tenant_tables as (
       'purchase_orders', 'audit_logs',
       'categories', 'product_batches',
       'price_lists', 'price_list_items', 'customer_groups', 'promotions',
-      'discount_limits', 'manual_discounts'
+      'discount_limits', 'manual_discounts',
+      'shifts', 'pos_sales', 'pos_payments', 'pos_sale_keys'
     )
 ),
 cols as (

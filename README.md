@@ -381,6 +381,38 @@ R2 adds pricing and promotions. It is additive: the only core-table change is a 
   apply an expired promotion; the cache is rebuildable and losing it costs one read. A write to
   `promotions` invalidates the key.
 
+## Retail extension (R3)
+
+R3 adds the online POS till. It is additive: it adds `shifts`, `pos_sales`, `pos_payments` and the
+small `pos_sale_keys` claim table, and it adds no column to a core table. See ADR-0014.
+
+- **A sale is a core invoice plus core payments, in one transaction.** `app.post_pos_sale` resolves
+  each scan to a variant (by barcode or id), prices it through the R2 pricing functions when no
+  price is given, calls `app.create_invoice` (gapless number, sorted stock locks, FIFO consumption,
+  balanced journal), then calls `app.allocate_payment` once per tender, then writes `pos_sales` and
+  `pos_payments`. The core balance check runs at commit. There is no async posting.
+- **Tenders.** `pos_payments` holds one row per tender. A sale may take USD and ZWG together; each
+  tender gets its own `pos_payments` row, its own core payment (Dr Bank, Cr AR), and the rate it
+  used. Change is recorded in the currency that was given.
+- **Idempotency.** `client_sale_id` makes a retried sale safe. The claim lives on the
+  non-partitioned `pos_sale_keys` table with `unique (org_id, client_sale_id)`, because Postgres
+  requires every unique constraint on a partitioned table to include the partition key (ADR-0014).
+  A retry returns the original receipt and consumes no invoice number.
+- **Shifts.** `shifts` is org and branch scoped, keyed by `till_id`, with `opened_at`, `closed_at`
+  and `opening_float`. The index `(org_id, branch_id, till_id, opened_at desc)` finds the open
+  shift for a till.
+- **The till is keyboard only** at `/pos`. A scan is one action (barcode + Enter), F9 tenders exact
+  cash, Enter confirms and prints. A one-item exact cash sale is three actions. The key script is in
+  `docs/pos-keys.md`.
+- **The cart is Zustand state**, never a server round trip, so scanning stays instant. Money is a
+  decimal string end to end.
+- **The receipt is 58mm, rendered in the browser** (`@page { width: 58mm }`), with no server call.
+  It shows the lines, the VAT breakdown by rate, the tenders with change, and the core invoice
+  number.
+- **Endpoints.** `POST /api/pos/sales` rings a sale, `GET /api/pos/sales` lists a shift's sales with
+  keyset pagination, `GET /api/pos/shifts` returns the till's context (open shift, default
+  warehouse, VAT rate), `POST /api/pos/shifts` opens a shift. All thin, all through `src/verticals/pos`.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -435,6 +467,17 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 | 38–40 | Concurrency | `tests/sales.test.ts` |
 | 41–44 | R1: products, barcodes, search | `tests/retail-r1.test.ts` |
 | 45–48 | R2: pricing and promotions | `tests/retail-r2.test.ts` |
+| 9–13 | R3: online POS sale | `tests/pos-r3.test.ts`, `e2e/pos-keyboard.e2e.ts` |
+
+Test 13 is the keyboard-only Playwright run and lives in `e2e/`. It starts its own dev server on
+port 12100 with its own dist dir (`.next-e2e`), so it never clashes with a running `npm run dev` and
+`npm run build` cannot clobber it:
+
+```bash
+npm run test:e2e
+```
+
+It needs a real browser: `npx playwright install chromium` once.
 
 ## Documentation
 

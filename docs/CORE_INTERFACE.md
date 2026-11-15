@@ -57,10 +57,12 @@ Org-scoped (no `branch_id`): `organizations`, `branches`, `memberships`, `invite
 Branch-scoped (also `branch_id`): `warehouses`, `stock_ledger`, `stock_consumptions`,
 `stock_balances`, `stock_layer_balances`, `stock_transfers`, `journals`, `journal_lines`,
 `sales_orders`, `invoices`, `invoice_lines`, `payments`, `credit_notes`, `purchase_orders`,
-`audit_logs`, and the R2 addition `manual_discounts`.
+`audit_logs`, the R2 addition `manual_discounts`, and the R3 additions `shifts`, `pos_sales`,
+`pos_payments`.
 
 Partitioned monthly on `created_at`: `journals`, `journal_lines`, `stock_ledger`,
-`stock_consumptions`, `audit_logs`. Their primary keys include `created_at`.
+`stock_consumptions`, `audit_logs`, and the R3 addition `pos_sales`. Their primary keys include
+`created_at`.
 
 ## TypeScript modules
 
@@ -109,3 +111,18 @@ reads the rate and tax it stores on the line.
   whose `discount_limits` row allows it and with a reason.
 * `POST /api/pos/price` and `src/verticals/retail/pricing.ts`. Redis caches promotion candidates
   only (key `promos:{org_id}`, TTL 300s), never a resolved price.
+
+## R3 extension (Retail: online POS sale)
+
+Additive, recorded in ADR-0014. It does not change core accounting logic; a sale calls the core
+invoice and payment functions.
+
+* New branch-scoped tables: `shifts` (till, `opened_at`, `closed_at`, `opening_float`),
+  `pos_sales` (partitioned monthly, PK `(id, created_at)`), `pos_payments` (one row per tender).
+* New org-scoped table: `pos_sale_keys` (the idempotency claim, `unique (org_id, client_sale_id)`).
+* `app.post_pos_sale(org_id, branch_id, warehouse_id, shift_id, client_sale_id, lines, tenders, ...)`
+  — one transaction: resolve lines, price via R2, `app.create_invoice`, one `app.allocate_payment`
+  per tender, write `pos_sales` and `pos_payments`. Idempotent on `client_sale_id`.
+* `app.open_shift(...)`, `app.list_pos_sales(...)`, `app.pos_sale_receipt(sale_id)`.
+* `POST /api/pos/sales`, `GET /api/pos/sales`, `GET /api/pos/shifts`, `POST /api/pos/shifts`, and
+  `src/verticals/pos/*` (`sales.ts`, `cart.ts`, `api.ts`). The till at `/pos` is keyboard only.

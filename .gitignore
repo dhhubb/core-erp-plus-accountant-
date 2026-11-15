@@ -9,3 +9,6 @@ coverage/
 .DS_Store
 supabase/.branches/
 supabase/.temp/
+test-results/
+playwright-report/
+.next-e2e/

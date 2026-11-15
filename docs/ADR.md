@@ -198,3 +198,26 @@ formats output. Both pricing functions are `language sql`, `security invoker`, w
 **Consequence.** A cart of N items costs one batched query (plus, on a cold cache, one candidates
 read), never N. `tests/retail-r2.test.ts` counts the round trips and asserts `EXPLAIN` shows
 `price_list_items_list_variant_key`.
+
+## ADR-0014 — The POS idempotency key lives on a small claim table, not on `pos_sales`
+
+**Context.** R3 asks for a `unique (org_id, client_sale_id)` constraint on `pos_sales` so that a
+retried sale (the terminal re-sends after a dropped response) does not ring twice. `pos_sales` is
+also required to be partitioned monthly on `created_at`. Postgres requires every unique constraint on
+a partitioned table to include all of the partitioning columns, so `unique (org_id, client_sale_id)`
+cannot exist on `pos_sales` — it would have to be `unique (org_id, client_sale_id, created_at)`,
+which does not prevent a duplicate with a different `created_at`. This was confirmed against the
+running Postgres with a probe table.
+
+**Decision.** The claim is enforced on `pos_sale_keys`, a small non-partitioned org-scoped table with
+`unique (org_id, client_sale_id)`. `app.post_pos_sale` inserts the claim as its first statement. A
+duplicate key raises a unique violation, the function catches it, looks up the original sale through
+the claim row and returns the original receipt unchanged. The retry therefore consumes no invoice
+number, takes no stock and posts no second journal. `pos_sales` keeps the required indexes
+`(org_id, branch_id, created_at desc, id desc)` and `(org_id, branch_id, shift_id)`.
+
+**Consequence.** `tests/pos-r3.test.ts` retries a sale with the same `client_sale_id` and asserts the
+same `sale_id` and `invoice_no` come back and that exactly one `pos_sales` row exists. The unique
+constraint the brief asks for exists in the schema, on the table where Postgres can enforce it. The
+claim table is mutable in the sense that it is inserted once and never updated; it carries no money
+and is rebuildable from `pos_sales`.

@@ -282,6 +282,7 @@ describe('M1 schema and indexes', () => {
       'stock_layer_balances', 'stock_transfers', 'journals', 'journal_lines',
       'sales_orders', 'invoices', 'invoice_lines', 'payments', 'credit_notes',
       'purchase_orders', 'audit_logs',
+      'shifts', 'pos_sales', 'pos_payments',
     ]) {
       const rows = await sql<{ indexdef: string }>(
         `select indexdef from pg_indexes where schemaname = 'public' and tablename = $1`,
@@ -317,7 +318,7 @@ describe('M1 schema and indexes', () => {
   });
 
   it('13. Partitioned tables have created_at in their primary key', async () => {
-    for (const table of ['journals', 'journal_lines', 'stock_ledger', 'stock_consumptions', 'audit_logs']) {
+    for (const table of ['journals', 'journal_lines', 'stock_ledger', 'stock_consumptions', 'audit_logs', 'pos_sales']) {
       const rows = await sql<{ pk_cols: string[] }>(
         `select array_agg(a.attname order by k.ord) as pk_cols
            from pg_constraint c
@@ -340,7 +341,7 @@ describe('M1 schema and indexes', () => {
     const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
     const nextKey = `${next.getUTCFullYear()}${String(next.getUTCMonth() + 1).padStart(2, '0')}`;
 
-    for (const table of ['journals', 'journal_lines', 'stock_ledger', 'stock_consumptions', 'audit_logs']) {
+    for (const table of ['journals', 'journal_lines', 'stock_ledger', 'stock_consumptions', 'audit_logs', 'pos_sales']) {
       for (const key of [current, nextKey]) {
         const rows = await sql<{ n: string }>(
           `select count(*)::text as n from pg_class c
