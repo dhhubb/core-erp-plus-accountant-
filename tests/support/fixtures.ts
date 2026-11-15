@@ -115,3 +115,59 @@ export async function createFiscalPeriod(
   if (!row) throw new Error('fiscal period insert returned no row');
   return row.id;
 }
+
+export async function addWarehouse(
+  tenant: Tenant,
+  code: string,
+  name = code,
+  allowNegativeStock = false,
+): Promise<string> {
+  const row = await one<{ id: string }>(
+    `insert into public.warehouses (org_id, branch_id, code, name, allow_negative_stock)
+     values ($1, $2, $3, $4, $5) returning id`,
+    [tenant.orgId, tenant.branchId, code, name, allowNegativeStock],
+  );
+  if (!row) throw new Error('warehouse insert returned no row');
+  return row.id;
+}
+
+export async function addProduct(tenant: Tenant, name = 'Product'): Promise<string> {
+  const row = await one<{ id: string }>(
+    `insert into public.products (org_id, sku, name)
+     values ($1, app.next_number($1, 'SKU'), $2) returning id`,
+    [tenant.orgId, name],
+  );
+  if (!row) throw new Error('product insert returned no row');
+  return row.id;
+}
+
+/** Post a receipt through app.post_receipt. Returns the inbound ledger id. */
+export async function postReceipt(
+  tenant: Tenant,
+  warehouseId: string,
+  productId: string,
+  qty: number | string,
+  unitCost: number | string,
+  postingDate = '2026-06-15',
+): Promise<string> {
+  const row = await one<{ app: string }>(
+    `select app.post_receipt($1, $2, $3, $4, null, $5, $6, $7::date) as app`,
+    [tenant.orgId, tenant.branchId, warehouseId, productId, qty, unitCost, postingDate],
+  );
+  return row!.app;
+}
+
+/** Run N async tasks concurrently and settle all of them. */
+export async function runConcurrently<T>(
+  count: number,
+  task: (index: number) => Promise<T>,
+): Promise<Array<{ ok: true; value: T } | { ok: false; error: Error }>> {
+  const results = await Promise.allSettled(
+    Array.from({ length: count }, (_, i) => task(i)),
+  );
+  return results.map((result) =>
+    result.status === 'fulfilled'
+      ? { ok: true as const, value: result.value }
+      : { ok: false as const, error: result.reason as Error },
+  );
+}

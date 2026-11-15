@@ -147,10 +147,12 @@ security definer
 set search_path = public, pg_temp
 as $$
 declare
-  v_layer     record;
-  v_remaining numeric(19, 4) := p_qty;
-  v_take      numeric(19, 4);
-  v_cost      numeric(19, 4) := 0;
+  v_layer      record;
+  v_remaining  numeric(19, 4) := p_qty;
+  v_take       numeric(19, 4);
+  v_cost       numeric(19, 4) := 0;
+  v_last_cost  numeric(19, 4) := 0;
+  v_allow_neg  boolean;
 begin
   for v_layer in
     select slb.in_ledger_id, slb.in_ledger_created_at, slb.unit_cost, slb.qty_remaining
@@ -181,12 +183,22 @@ begin
        and in_ledger_created_at = v_layer.in_ledger_created_at;
 
     v_cost := v_cost + round(v_take * v_layer.unit_cost, 4);
+    v_last_cost := v_layer.unit_cost;
     v_remaining := v_remaining - v_take;
   end loop;
 
   if v_remaining > 0 then
-    raise exception 'insufficient stock for product %: short by %', p_product_id, v_remaining
-      using errcode = '23514';
+    -- Negative stock is rejected by default. A warehouse setting can allow it; the shortfall is
+    -- then valued at the most recent inbound cost (or zero when there is no history).
+    select w.allow_negative_stock into v_allow_neg
+      from public.warehouses w where w.id = p_warehouse_id;
+
+    if not coalesce(v_allow_neg, false) then
+      raise exception 'insufficient stock for product %: short by %', p_product_id, v_remaining
+        using errcode = '23514';
+    end if;
+
+    v_cost := v_cost + round(v_remaining * v_last_cost, 4);
   end if;
 
   return v_cost;

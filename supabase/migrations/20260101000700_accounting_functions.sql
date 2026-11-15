@@ -217,6 +217,13 @@ begin
     if v_debit < 0 or v_credit < 0 then
       raise exception 'journal line amounts must not be negative' using errcode = '23514';
     end if;
+
+    -- A zero-amount line carries no accounting information (e.g. a sale whose FIFO cost is zero).
+    -- Skip it rather than emit an invalid line.
+    if v_debit = 0 and v_credit = 0 then
+      continue;
+    end if;
+
     if (v_debit > 0) = (v_credit > 0) then
       raise exception 'a journal line has either a debit or a credit, never both'
         using errcode = '23514';

@@ -11,7 +11,7 @@ Schema: plain SQL migrations in `supabase/migrations/` (no Prisma).
 | M0 | Setup | build passes on empty app | DONE |
 | M1 | Tenancy (RLS, indexes, partitions) | tests 1–14 | DONE |
 | M2 | Accounting | tests 15–24 | DONE |
-| M3 | Inventory | tests 25–31 | todo |
+| M3 | Inventory | tests 25–31 | DONE |
 | M4 | Sales & purchases + concurrency | tests 32–40 | todo |
 | M5 | Hardening (audit, checks, perf, README) | verification list | todo |
 
@@ -111,6 +111,28 @@ $ npx vitest run tests/accounting.test.ts
   rate it used, so later rate changes do not rewrite history.
 * Rounding: `post_journal` rounds base amounts to 4 dp per line and posts any residual to the
   rounding account from `settings`.
+
+## M3 — Inventory
+
+`tests/inventory.test.ts` covers tests 25–31.
+
+```
+$ npx vitest run tests/inventory.test.ts
+ Test Files  1 passed (1)
+      Tests  7 passed (7)
+```
+
+* FIFO: `app.consume_fifo` walks `stock_layer_balances` ordered by `(in_ledger_created_at,
+  in_ledger_id)`, locking each layer `FOR UPDATE`. Every consumption is a new
+  `stock_consumptions` row; a layer row is only ever decremented, never rewritten.
+* Lock order: `app.lock_stock_balances(org, branch, keys)` locks the `stock_balances` rows one key
+  at a time in ascending `(warehouse_id, product_id, variant_id)` order.
+* Negative stock is rejected by default; `warehouses.allow_negative_stock` opts a warehouse in,
+  in which case the shortfall is valued at the most recent inbound cost.
+* `post_receipt` and `post_stock_adjustment` each write ledger rows and a balanced journal in one
+  transaction.
+* SKUs come from `number_series` via `app.next_number` (locked `FOR UPDATE`), never from a
+  Postgres sequence.
 
 ## Notes / decisions recorded in docs/ADR.md
 
