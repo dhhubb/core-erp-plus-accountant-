@@ -1,8 +1,10 @@
-# PROGRESS — ERP Core Phase 1 (Backend)
+# PROGRESS — ERP Core
 
 Repo root: `/workspace/project`
 Stack: Next.js 14 (App Router) · TypeScript strict · Supabase (local Postgres 17 + Auth) · Vitest · `pg`
 Schema: plain SQL migrations in `supabase/migrations/` (no Prisma).
+
+Phase 1 (the core) is complete: tests 1–40. R1 extends the core additively: tests 41–44.
 
 ## Status
 
@@ -14,6 +16,7 @@ Schema: plain SQL migrations in `supabase/migrations/` (no Prisma).
 | M3 | Inventory | tests 25–31 | DONE |
 | M4 | Sales & purchases + concurrency | tests 32–40 | DONE |
 | M5 | Hardening (audit, checks, perf, README) | verification list | DONE |
+| R1 | Retail extension: products, barcodes, search | tests 41–44 | DONE |
 
 ## M0 — Setup
 
@@ -237,3 +240,60 @@ Environment note: this session began on a recycled runtime (Docker down, Supabas
 The environment was restored (dockerd restarted, Supabase CLI v3.1.0 installed, local stack up) and
 all Phase 1 gates were re-verified on a clean database: `npm test` 40 passed (40), `npm run build`
 compiled successfully, `npm run lint` clean, both check scripts 0 rows.
+
+## R1 — Retail extension: products, barcodes and search
+
+Additive. The core is not rewritten and no core accounting logic changed. Two new org-scoped tables
+and a set of nullable/defaulted columns on `products` and `product_variants` (ADR-0008). Tests 41–44
+in `tests/retail-r1.test.ts`.
+
+Migration: `supabase/migrations/20260101010000_retail_r1_products_search.sql`.
+
+* `categories` (nested via `parent_id`), `product_batches` (batch master) — org-scoped, RLS forced,
+  indexes and FK indexes per the core rules.
+* `products`: `category_id`, `unit product_unit`, `is_weighable`, generated `name_search tsvector`.
+* `product_variants`: `size`, `color`, `barcode` (partial unique per org).
+* `app.search_products(org_id, query, limit)` — exact barcode first, then trigram name match,
+  capped at 20, backed by `products (org_id extensions.uuid_ops, name extensions.gin_trgm_ops)`.
+* `GET /api/pos/search?q=` plus `src/verticals/retail/{products,quantity,debounce,TillSearch}`.
+
+The 4 tests:
+
+| # | Test |
+|---|------|
+| 41 | Barcode lookup returns the correct variant in under 100 ms on 1,000 products |
+| 42 | Name search returns at most 20 results and EXPLAIN shows the trigram index |
+| 43 | Org A cannot read or search Org B rows in every R1 table |
+| 44 | A weighable product stores quantity 0.750 kg exactly |
+
+Gate evidence:
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  5 passed (5)
+      Tests  44 passed (44)
+
+$ npm run build
+ ✓ Compiled successfully
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ psql "$DATABASE_URL" -f scripts/check-fk-indexes.sql
+(0 rows)
+
+$ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+Notes:
+
+* Core test 9 (every FK column has an index) drove two extra indexes on the new composite FKs:
+  `categories (org_id, parent_id)` and `products (org_id, category_id)`.
+* Search correctness and index use both depend on the function inlining (ADR-0009): no
+  `set search_path`, and a parenthesised `UNION ALL` instead of a CTE.
+* `docs/CORE_INTERFACE.md` was a stated starting condition but did not exist; it has been written
+  from the Phase 1 migrations.

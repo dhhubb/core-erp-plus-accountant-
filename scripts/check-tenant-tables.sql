@@ -17,7 +17,8 @@ with tenant_tables as (
       'warehouses', 'stock_ledger', 'stock_consumptions', 'stock_balances',
       'stock_layer_balances', 'stock_transfers', 'journals', 'journal_lines',
       'sales_orders', 'invoices', 'invoice_lines', 'payments', 'credit_notes',
-      'purchase_orders', 'audit_logs'
+      'purchase_orders', 'audit_logs',
+      'categories', 'product_batches'
     )
 ),
 cols as (

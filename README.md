@@ -23,6 +23,7 @@ migrations, and Prisma usually connects as a role that bypasses RLS.
 - [Accounting engine](#accounting-engine)
 - [Inventory](#inventory)
 - [Sales and purchases](#sales-and-purchases)
+- [Retail extension (R1)](#retail-extension-r1)
 - [Adding a vertical module](#adding-a-vertical-module)
 - [Tests, checks and the perf run](#tests-checks-and-the-perf-run)
 
@@ -312,6 +313,36 @@ is 100; anything else is rejected. `OFFSET` is never used. Queries use explicit 
 
 A generic trigger writes `audit_logs` for `invoices`, `payments`, `journals`, `products` and
 `stock_ledger` (receipts and adjustments). Nothing on a request path reads it.
+
+## Retail extension (R1)
+
+R1 is the first additive extension of the core. It adds the product, barcode and search surface a
+till needs, without touching a core accounting path. See `docs/ADR.md` (ADR-0008, ADR-0009) and
+`docs/CORE_INTERFACE.md`.
+
+- **New tables.** `categories` (nested through `parent_id`, org-scoped) and `product_batches`
+  (batch master: `batch_no`, `expiry_date`). Both use the standard RLS, index and check rules.
+- **New columns.** `products` gains `category_id`, `unit` (the `product_unit` enum), `is_weighable`
+  and a generated `name_search tsvector`. `product_variants` gains `size`, `color` and `barcode`.
+  Every column is nullable or defaulted, so existing rows and core code are unaffected.
+- **Barcodes** live on the variant and are unique within an org only when present, enforced by a
+  partial unique index `product_variants (org_id, barcode) where barcode is not null`.
+- **Weighable items** accept a decimal quantity (for example `0.750` kg); everything else accepts
+  whole units only. `src/verticals/retail/quantity.ts` normalises a till quantity to `NUMERIC(19,4)`
+  and rejects anything else.
+- **Search.** `app.search_products(org_id, query, limit)` matches an exact barcode first, then a
+  trigram name match, ordered by relevance and capped at 20 rows. It is backed by a single combined
+  GIN index `products (org_id extensions.uuid_ops, name extensions.gin_trgm_ops)`, so the org
+  predicate and the trigram predicate use one index. An empty query returns nothing: the till never
+  loads the catalogue at startup.
+- **Endpoint.** `GET /api/pos/search?q=` is a thin handler over `src/verticals/retail/products.ts`.
+- **Client.** `src/verticals/retail/TillSearch.tsx` debounces input by 150 ms, so one request goes
+  out after the cashier stops typing, and fetches nothing on mount.
+
+To keep the name search an index scan, the SQL function is inlined: it carries no `set search_path`
+clause (that clause blocks inlining) and its body is a parenthesised `UNION ALL` rather than a CTE
+(a CTE is materialised, which hides the constant term from the planner). Every object is
+schema-qualified, so inlining is safe.
 
 ## Adding a vertical module
 

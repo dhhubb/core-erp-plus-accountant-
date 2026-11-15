@@ -82,3 +82,66 @@ the planner would correctly prefer a sequential scan — an artefact of the seed
 partition holds realistic multi-tenant data and the measured plan reflects production. With that
 distribution the one-month query prunes to one partition and uses
 `journal_lines_<YYYYMM>_org_id_idx`. Timings are recorded, not enforced.
+
+## ADR-0008 — R1 adds columns to the core `products` and `product_variants` tables
+
+**Context.** R1 (Retail: products, barcodes, search) needs a unit of measure, a weighable flag, a
+category, and a barcode. The core already owns `products` and `product_variants`, and the standing
+rule is that a vertical never edits a core table without an ADR. Putting the barcode on a separate
+table was considered, but a barcode identifies a sellable unit (a variant), so it belongs with the
+variant, and a partial unique index enforces uniqueness only when a barcode is present.
+
+**Decision.** Extend the core tables additively rather than forking them:
+
+* `products` gains `category_id uuid`, `unit product_unit not null default 'each'`,
+  `is_weighable boolean not null default false`, and a generated `name_search tsvector`.
+* `product_variants` gains `size`, `color` and `barcode`.
+* Two new org-scoped tables, `categories` (nested) and `product_batches` (batch master).
+* A `(org_id, name gin_trgm_ops)` GIN index on `products.name`, and
+  `app.search_products(org_id, query, limit)`.
+
+All new columns are nullable or have a default, so existing rows and existing core code are
+unaffected. No core accounting path is touched.
+
+**Consequence.** `docs/CORE_INTERFACE.md` records the additions. A later vertical that needs its own
+product attributes should still prefer its own table keyed on `product_id`, and must write its own
+ADR before adding another column to `products`.
+
+## ADR-0009 — Search is a GIN trigram index plus an inlined SQL function
+
+**Context.** The till must find a product by exact barcode, or by a partial name, in well under
+100 ms, without loading the catalogue at startup. The name search must stay an index scan as the
+catalogue grows, and an `EXPLAIN` of the search must show the index in use.
+
+**Decision.**
+
+* The name predicate is `name ILIKE '%term%'`. That is the operator a `gin_trgm_ops` index serves
+  directly, so a substring search stays an index scan rather than scanning the org's whole
+  catalogue.
+* The index is a single combined GIN index `(org_id extensions.uuid_ops, name extensions.gin_trgm_ops)`,
+  so the RLS org predicate and the trigram predicate are served by one index.
+* `app.search_products` is `language sql`, `security invoker`, with **no `set search_path` clause**.
+  A `set` clause stops the planner inlining a SQL function, and an inlined body is what lets
+  `EXPLAIN` show the trigram index. Every object in the body is schema-qualified, so inlining is
+  safe.
+* The body is a parenthesised `UNION ALL` (barcode hit first, then name hits), not a CTE. A CTE is
+  materialised, which hides the constant term from the planner and drops the index.
+
+**Consequence.** `tests/retail-r1.test.ts` asserts the plan contains `products_name_trgm_idx`. The
+planner only prefers the trigram index once an org's catalogue is large enough to beat a sequential
+scan (measured at roughly 15,000 products in one org), so that test seeds 20,000 rows. Relevance is
+`extensions.word_similarity(term, name)`, which ranks a term found inside a longer name above a
+merely similar one.
+
+## ADR-0010 — R1 test numbering continues from the core's 40
+
+**Context.** Phase 1 owns tests 1–40 and forbids renumbering. The Phase 2 backlog planned tests
+41–44 for rate limiting (P2-01), which is not built.
+
+**Decision.** The R1 run (this one) owns tests 41–44 in `tests/retail-r1.test.ts`. A later run that
+implements a different Phase 2 item continues from the highest number actually present, not from a
+range reserved in the backlog. Ranges in `docs/phase2/README.md` are indicative, as that document
+already states.
+
+**Consequence.** Test numbers are allocated in the order items are actually built, so no number is
+skipped and no two runs collide.

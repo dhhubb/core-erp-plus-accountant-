@@ -43,6 +43,9 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'credit_notes', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'purchase_orders', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'audit_logs', scope: 'branch', highVolume: true, partitioned: true },
+  // R1 (retail): products, barcodes and search.
+  { name: 'categories', scope: 'org', highVolume: false, partitioned: false },
+  { name: 'product_batches', scope: 'org', highVolume: false, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -277,6 +280,18 @@ export async function seedOneRowPerTenantTable(
     `insert into public.audit_logs (org_id, branch_id, table_name, record_id, action)
      values ($1, $2, 'invoices', $3, 'insert')`,
     [orgId, branchId, invoiceId],
+  );
+
+  await sql(
+    `insert into public.categories (org_id, name, slug)
+     values ($1, 'Seed Category', $2)`,
+    [orgId, `seed-cat-${randomUUID().slice(0, 8)}`],
+  );
+
+  await sql(
+    `insert into public.product_batches (org_id, variant_id, batch_no, expiry_date)
+     values ($1, (select id from public.product_variants where org_id = $1 limit 1), $2, date '2030-01-01')`,
+    [orgId, `BATCH-${randomUUID().slice(0, 8)}`],
   );
 
   return {
