@@ -25,6 +25,8 @@ migrations, and Prisma usually connects as a role that bypasses RLS.
 - [Sales and purchases](#sales-and-purchases)
 - [Retail extension (R1)](#retail-extension-r1)
 - [Retail extension (R2)](#retail-extension-r2)
+- [Retail extension (R3)](#retail-extension-r3)
+- [Retail extension (R4)](#retail-extension-r4)
 - [Adding a vertical module](#adding-a-vertical-module)
 - [Tests, checks and the perf run](#tests-checks-and-the-perf-run)
 
@@ -413,6 +415,36 @@ small `pos_sale_keys` claim table, and it adds no column to a core table. See AD
   keyset pagination, `GET /api/pos/shifts` returns the till's context (open shift, default
   warehouse, VAT rate), `POST /api/pos/shifts` opens a shift. All thin, all through `src/verticals/pos`.
 
+## Retail extension (R4)
+
+R4 makes the till work offline. It is additive: it adds `pos_sync_exceptions` and re-creates two
+core functions with a hook. See ADR-0015, ADR-0016, ADR-0017 and ADR-0018.
+
+- **The outbox is IndexedDB** (`src/verticals/pos/outbox.ts`). A sale that cannot reach the server
+  is written to the store before anything else, so it survives a reload or a crash. Each entry
+  carries the `client_sale_id` generated at sale time, the `shift_id`, the till's local timestamp,
+  the lines with the prices actually charged, the promotions that applied, and the tenders.
+- **Sync delivers in batches.** `POST /api/pos/sync` accepts up to 50 sales and runs each in its own
+  transaction on its own connection, under the caller's RLS context, so one bad sale cannot block
+  the rest. The till's drain loop keeps one request in flight and removes an entry only when the
+  server reports `committed` or `duplicate`. Retries use exponential backoff with full jitter.
+- **Idempotency is the whole safety net.** The `client_sale_id` is the key on both paths. A duplicate
+  returns the original receipt and posts nothing, which is what makes the retries safe.
+- **A completed sale is never rejected.** A short-stock sale is retried once with the
+  transaction-local allow-negative hook (`app.negative_stock_allowed()`, ADR-0015) and logged as
+  `negative_stock`. A moved price or an expired promotion is honoured and logged as
+  `price_variance` / `promotion_expired`. Only a malformed sale is reported as `exception`. Every
+  exception is a row in `pos_sync_exceptions`.
+- **The hook is transaction-local.** `set_config('app.allow_negative_stock', 'on', true)` is set
+  only for the retry attempt, so it cannot leak to another request on a pooled connection, and the
+  live sale path keeps the strict rule.
+- **Live sales are rate limited, the backlog is not.** `POST /api/pos/sales` allows 30 sales per
+  minute per cashier and returns `429` with `Retry-After` past that. `POST /api/pos/sync` is exempt,
+  so a backlog of completed sales is never throttled away. Counters live in Redis, prefixed by
+  `org_id`, and the ledger is unaware of them (ADR-0018).
+- **Endpoints.** `POST /api/pos/sync` delivers a backlog; `POST /api/pos/sales` gains the limiter.
+  The `/pos` page shows `Pending n` and drains the outbox on load, on reconnect and every 15s.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -468,10 +500,12 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 | 41–44 | R1: products, barcodes, search | `tests/retail-r1.test.ts` |
 | 45–48 | R2: pricing and promotions | `tests/retail-r2.test.ts` |
 | 9–13 | R3: online POS sale | `tests/pos-r3.test.ts`, `e2e/pos-keyboard.e2e.ts` |
+| 14–18 | R4: offline outbox and sync | `tests/pos-r4.test.ts`, `e2e/pos-offline.e2e.ts` |
 
-Test 13 is the keyboard-only Playwright run and lives in `e2e/`. It starts its own dev server on
-port 12100 with its own dist dir (`.next-e2e`), so it never clashes with a running `npm run dev` and
-`npm run build` cannot clobber it:
+Test 13 is the keyboard-only Playwright run and test 14 is the offline reload-and-reconnect run;
+both live in `e2e/`. The e2e config starts its own dev server on port 12100 with its own dist dir
+(`.next-e2e`), so it never clashes with a running `npm run dev` and `npm run build` cannot clobber
+it:
 
 ```bash
 npm run test:e2e

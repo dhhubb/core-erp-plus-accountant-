@@ -221,3 +221,116 @@ same `sale_id` and `invoice_no` come back and that exactly one `pos_sales` row e
 constraint the brief asks for exists in the schema, on the table where Postgres can enforce it. The
 claim table is mutable in the sense that it is inserted once and never updated; it carries no money
 and is rebuildable from `pos_sales`.
+
+## ADR-0015 — The allow-negative hook is a transaction-local GUC read by the core posting functions
+
+**Context.** R4 requires that a sale completed offline is never rejected, even when the stock it
+sold is gone by the time it syncs. The core rejects an outbound movement beyond available stock
+unless the warehouse's `allow_negative_stock` is set, and that setting belongs to the warehouse, not
+to a single caller. Flipping it on the warehouse to accept one backlog sale would permanently permit
+overselling for every later sale at that till, which is not acceptable.
+
+`app.create_invoice` and `app.consume_fifo` are the two places that raise `insufficient stock`. They
+live in applied migrations, and an applied migration is never edited (AGENTS.md).
+
+**Decision.** Add a transaction-local escape hatch read by those functions:
+
+* `app.negative_stock_allowed()` returns true when the GUC `app.allow_negative_stock` is `on`.
+* The R4 migration re-creates `app.create_invoice` and `app.consume_fifo` verbatim, changing only
+  the availability guard to `not (coalesce(v_allow_neg, false) or app.negative_stock_allowed())`.
+* The sync path sets the GUC for its transaction with `set_config('app.allow_negative_stock','on',
+  true)` and only for the retry attempt. The live-sale path never sets it, so the live till keeps
+  the strict rule.
+
+Re-creating a function in a new migration is additive: the applied migration is untouched, and the
+newest definition wins for every later caller.
+
+**Consequence.** A backlog sale always posts, and the shortfall is valued at the most recent inbound
+cost (the existing negative branch of `consume_fifo`). The GUC is transaction-local, so it cannot
+leak to another request on the same pooled connection. Every accepted shortfall is written to
+`pos_sync_exceptions` as `negative_stock`, so the oversell is visible rather than silent.
+`tests/pos-r4.test.ts` test 17 proves the live path still rejects and the sync path accepts.
+
+## ADR-0016 — The sync endpoint never rejects a completed sale; it records an exception
+
+**Context.** An offline till can ring a sale the server would refuse today: the price moved, a
+promotion expired, or the stock is gone. The brief is explicit: never reject a completed sale. But
+accepting it silently would hide a real disagreement between what the customer was charged and what
+the server would charge now.
+
+**Decision.** `POST /api/pos/sync` runs each sale in its own transaction and reports it as
+`committed`, `duplicate` or `exception`. Within a sale:
+
+1. A `client_sale_id` that already has a posted sale is a `duplicate`; the original receipt is
+   returned and nothing is posted (the `pos_sale_keys` claim of ADR-0014).
+2. The charged unit price is kept, never re-priced. When it differs from the current price, a
+   `price_variance` row is written to `pos_sync_exceptions`.
+3. When the charged price is below the current price and an expired promotion would have explained
+   it, a `promotion_expired` row is written and the charged price still stands.
+4. When stock is short, the sale is retried with the allow-negative hook (ADR-0015) and a
+   `negative_stock` row is written.
+5. A sale that cannot post for any other reason (unknown barcode, malformed tender) is reported as
+   `exception` and a `rejected` row is written in its own transaction, so it survives the rollback.
+
+Only a malformed sale is refused; a sale that is merely out of date is accepted and logged. The
+response carries the per-sale outcome and the ids of any exceptions raised.
+
+**Consequence.** The batch is fault-isolated: one bad sale cannot block the other 49. The till
+removes an outbox entry only when the server reports `committed` or `duplicate`, so a `rejected`
+sale stays queued for the operator. `tests/pos-r4.test.ts` tests 16 and 17 cover the duplicate and
+negative-stock paths.
+
+## ADR-0017 — The offline outbox lives in IndexedDB and syncs one sale per transaction
+
+**Context.** The till must keep selling when the network is down. A completed sale has already
+taken the customer's cash, so losing it is not an option, and ringing it twice is not an option
+either. The server also has to stay the source of truth: stock, prices and the ledger are decided
+there, not on the terminal.
+
+**Decision.**
+
+1. **Storage.** Each offline sale is written to an IndexedDB object store (`erp-pos-outbox`,
+   `src/verticals/pos/outbox.ts`) before the network call. IndexedDB is transactional and survives a
+   reload, a crash or a flat battery; the cart's in-memory state does not. The entry keeps the
+   `client_sale_id` generated at sale time, the `shift_id`, the till's local timestamp, the lines
+   with the prices actually charged, the promotions that applied, and the tenders.
+2. **Delivery.** `POST /api/pos/sync` accepts up to 50 sales per request. Each sale runs in its own
+   transaction on its own pooled connection (`src/verticals/pos/syncServer.ts`), under the caller's
+   RLS context, so one bad sale cannot roll back the other 49. The till's drain loop
+   (`src/verticals/pos/sync.ts`) keeps exactly one request in flight, so two ticks cannot deliver
+   the same sale twice.
+3. **Idempotency.** The `client_sale_id` is the idempotency key on both paths (ADR-0014). A sale
+   that already posted is a `duplicate`; the original receipt is returned and nothing is posted.
+4. **Retries.** An entry is removed from the outbox only when the server reports `committed` or
+   `duplicate`. Anything else stays queued and is retried with exponential backoff and full jitter,
+   capped at five minutes.
+5. **Never reject a completed sale.** A sale that the strict rules would refuse (short stock, moved
+   price, expired promotion) is accepted and logged (ADR-0016). The live path keeps the strict
+   rules; only the sync path relaxes them, and only through the transaction-local hook (ADR-0015).
+
+**Consequence.** The outbox is a durable client-side queue whose entries are removed only on a
+positive server acknowledgement, so the design is at-least-once with server-side deduplication
+rather than at-most-once. A duplicate delivery is a no-op, which is the property that makes the
+retries safe. `tests/pos-r4.test.ts` covers survival across a reload (test 14), a full drain
+(test 15), duplicate delivery (test 16) and the oversell path (test 17); `e2e/pos-offline.e2e.ts`
+covers the reload-and-reconnect flow end to end.
+
+## ADR-0018 — Live sales are rate limited in Redis; the sync backlog is exempt
+
+**Context.** A runaway till (a stuck key, a retry loop, a script) can hammer `POST /api/pos/sales`.
+The brief allows Redis for counters and the promotion cache, with keys prefixed by `org_id`. It also
+requires that a backlog of completed sales never be throttled away.
+
+**Decision.** Live sales are limited to 30 per minute per cashier. The counter is a fixed-window
+counter in Redis (`ratelimit:livesale:{org_id}:{branch_id}:{cashier_id}:{window}`), incremented with
+`INCR` and given a TTL on first increment, so the key is prefixed by the org and Redis holds a
+counter and nothing else. A request past the limit gets `429` with `Retry-After` and the existing
+`{"error": "..."}` body.
+
+`POST /api/pos/sync` is deliberately exempt. It carries sales that are already complete; refusing a
+backlog would strand money that has already changed hands. Only the live path is limited.
+
+**Consequence.** The limit is per cashier, so one cashier cannot exhaust another's budget, and the
+ledger is unaware of the limiter. Losing the Redis keys costs at most a fresh window; nothing
+durable lives there. `tests/pos-r4.test.ts` test 18 proves the 31st live sale is `429` while a
+100-sale backlog syncs with no `429`.

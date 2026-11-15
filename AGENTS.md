@@ -65,9 +65,25 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
   depend on it.
 * **`language sql` pricing functions must have no `set search_path` clause**, or they will not
   inline and `EXPLAIN` will not show `price_list_items_list_variant_key`.
+* **A route file may only export HTTP handlers.** Exporting a plain constant (e.g. a batch size)
+  from `src/app/api/**/route.ts` fails `next build` with "is not a valid Route export field". Keep
+  such constants in a module the route imports.
+* **Re-creating a function is the additive way to change it.** `create or replace function` in a
+  new migration leaves the applied migration untouched; the newest definition wins. R4 re-creates
+  `app.create_invoice` and `app.consume_fifo` this way, changing only the availability guard.
+* **The offline hook is a transaction-local GUC.** `app.negative_stock_allowed()` reads
+  `current_setting('app.allow_negative_stock', true)`, set with `set_config(..., true)` only by the
+  sync retry. It never leaks to another pooled request, and the live path never sets it.
+* **`fake-indexeddb` is a real IndexedDB implementation, not a mock.** Import
+  `fake-indexeddb/auto` at the top of a test that uses the outbox; the outbox module runs for real.
+  `vi.resetModules()` plus a fresh dynamic `import()` simulates a page reload (only IndexedDB
+  carries state).
+* **The sync endpoint is exempt from the rate limiter.** `POST /api/pos/sales` is limited per
+  cashier; `POST /api/pos/sync` is not, so a backlog is never throttled away.
 
 ## Test numbering
 
 Phase 1 owns 1–40. R1 owns 41–44 (`tests/retail-r1.test.ts`). R2 owns 45–48
-(`tests/retail-r2.test.ts`). A new run continues from the highest number actually present; ranges in
-`docs/phase2/README.md` are indicative only (ADR-0010).
+(`tests/retail-r2.test.ts`). R3 owns 9–13 (`tests/pos-r3.test.ts` plus the keyboard e2e). R4 owns
+14–18 (`tests/pos-r4.test.ts` plus the offline e2e). A new run continues from the highest number
+actually present; ranges in `docs/phase2/README.md` are indicative only (ADR-0010).

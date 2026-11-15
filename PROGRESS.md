@@ -20,6 +20,7 @@ pricing and promotions: tests 45–48.
 | R1 | Retail extension: products, barcodes, search | tests 41–44 | DONE |
 | R2 | Retail extension: pricing and promotions | tests 45–48 | DONE |
 | R3 | Retail extension: online POS sale | tests 9–13 | DONE |
+| R4 | Retail extension: offline outbox and sync | tests 14–18 | DONE |
 
 ## M0 — Setup
 
@@ -429,3 +430,81 @@ Notes:
   the F9 exact-cash tender equals the invoice total to the cent.
 * `shifts` and `pos_payments` carry the `(org_id, branch_id, created_at desc, id desc)` index so the
   schema invariants (test 11) cover them without a special case.
+
+## R4 — Retail extension: offline outbox and sync
+
+Additive. Nothing in an applied migration was edited; the two re-created core functions
+(`app.consume_fifo`, `app.create_invoice`) and the new sync entry point live in a new migration.
+
+Migration: `20260101040000_pos_r4_offline_sync.sql`.
+
+* New branch-scoped table `pos_sync_exceptions` (where a synced sale that could not post strictly is
+  recorded instead of being refused), with the `(org_id, branch_id, created_at desc, id desc)`
+  index and forced RLS.
+* `app.negative_stock_allowed()` — the transaction-local allow-negative hook (ADR-0015).
+* `app.consume_fifo` and `app.create_invoice` re-created verbatim with the hook added to the
+  availability guard. Only the guard line changed.
+* `app.sync_pos_sale(...)` — one call per offline sale. Never rejects a completed sale (ADR-0016).
+
+TypeScript:
+
+* `src/verticals/pos/outbox.ts` — IndexedDB outbox, `client_sale_id` generated at sale time,
+  exponential backoff with full jitter.
+* `src/verticals/pos/sync.ts` — the drain loop, one request in flight, removes an entry only on
+  `committed` or `duplicate`.
+* `src/verticals/pos/syncServer.ts` — one transaction per sale on its own connection, under the
+  caller's RLS context.
+* `src/verticals/pos/rateLimit.ts` — live-sale limiter, Redis counters prefixed by org (ADR-0018).
+* `src/app/api/pos/sync/route.ts` — `POST /api/pos/sync`, up to 50 sales, exempt from the limiter.
+* `POST /api/pos/sales` is rate limited to 30 sales/minute/cashier and returns `429` with
+  `Retry-After` past that (ADR-0018).
+* `/pos` queues a sale on a network failure or a `429`/`5xx`, shows `Pending n`, and drains the
+  outbox on load, on reconnect and every 15 seconds.
+
+The R4 tests (14–18):
+
+| # | Test |
+| --- | --- |
+| 14 | A sale completed offline survives a page reload in IndexedDB with its UUID, lines, prices and shift intact |
+| 15 | Reconnecting syncs every queued sale and clears the outbox; each sale reaches the ledger once |
+| 16 | The same `client_sale_id` twice posts once; the second request is a `duplicate` with the original receipt |
+| 17 | A sale synced after stock hit zero is accepted and logged as a `negative_stock` exception; the live path still rejects; the ledger balances |
+| 18 | The 31st live sale in one minute is `429` with `Retry-After`; a 100-sale sync backlog is accepted with no `429` |
+
+Gate evidence (R4):
+
+```
+$ supabase db reset
+Applying migration 20260101040000_pos_r4_offline_sync.sql...
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  8 passed (8)
+      Tests  59 passed (59)
+
+$ npm run build
+ ✓ Compiled successfully
+ ✓ Generating static pages (4/4)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ psql "$DATABASE_URL" -f scripts/check-fk-indexes.sql
+(0 rows)
+
+$ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql
+(0 rows)
+
+$ npx playwright test
+  2 passed (7.5s)
+```
+
+Notes:
+
+* `pos_sync_exceptions` is registered in `tests/support/tenant-tables.ts` and
+  `scripts/check-tenant-tables.sql`, so the table-driven RLS test (test 2) and the schema checks
+  cover it without a special case.
+* IndexedDB is provided in Vitest by `fake-indexeddb` — a real in-memory implementation of the
+  IndexedDB API, not a stub of `outbox.ts`. The outbox module and the route handlers run for real.
+* Redis counters are prefixed `ratelimit:livesale:{org_id}:{branch_id}:{cashier_id}:{window}`. Redis
+  holds counters only; the ledger is unaffected and the counters are safe to lose.

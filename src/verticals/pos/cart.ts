@@ -60,7 +60,7 @@ export interface PosReceipt {
   payments: PosReceiptPayment[];
 }
 
-export type PosStatus = 'idle' | 'posting' | 'paid' | 'error';
+export type PosStatus = 'idle' | 'posting' | 'paid' | 'queued' | 'error';
 
 interface CartState {
   lines: CartLine[];

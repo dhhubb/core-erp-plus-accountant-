@@ -3,6 +3,8 @@
 import Decimal from 'decimal.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiFetch } from '@/verticals/pos/api';
+import { enqueueSale, countPending, type OutboxSale } from '@/verticals/pos/outbox';
+import { syncOnce } from '@/verticals/pos/sync';
 import {
   cartTotals,
   remainingBase,
@@ -62,6 +64,8 @@ export default function PosPage() {
   const [taxRate, setTaxRate] = useState(new Decimal('0.15'));
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [selected, setSelected] = useState(0);
+  const [pending, setPending] = useState(0);
+  const [syncing, setSyncing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const totals = useMemo(() => cartTotals(lines), [lines]);
@@ -114,6 +118,35 @@ export default function PosPage() {
   useEffect(() => {
     setZwgRate(ZWG_SEED_RATE);
   }, [setZwgRate]);
+
+  // The offline outbox sync loop. On load, count what survived the reload; then keep trying to
+  // drain it. Only one request is ever in flight (syncOnce guards it), and an entry is removed
+  // only when the server reports it committed or duplicate.
+  const drain = useCallback(async () => {
+    setSyncing(true);
+    try {
+      await syncOnce();
+    } finally {
+      setSyncing(false);
+      setPending(await countPending());
+    }
+  }, []);
+
+  useEffect(() => {
+    void (async () => setPending(await countPending()))();
+  }, []);
+
+  useEffect(() => {
+    const onOnline = () => void drain();
+    window.addEventListener('online', onOnline);
+    const timer = setInterval(() => void drain(), 15_000);
+    // Try immediately as well, so a backlog left by a previous session drains on load.
+    void drain();
+    return () => {
+      window.removeEventListener('online', onOnline);
+      clearInterval(timer);
+    };
+  }, [drain]);
 
   // The scanner behaves as a keyboard: it types the barcode and sends Enter. Keep focus on the
   // scan field so no mouse is ever needed.
@@ -203,34 +236,81 @@ export default function PosPage() {
     if (lines.length === 0 || tenders.length === 0) return;
     setStatus('posting');
     setError(null);
+
+    // The id is generated once, here, at sale time. It is the server's idempotency key, so a
+    // retry — live, queued or synced — can never ring the sale twice.
+    const clientSaleId = crypto.randomUUID();
+
+    const saleBody = {
+      warehouse_id: warehouseId,
+      shift_id: shiftId,
+      client_sale_id: clientSaleId,
+      tax_code: taxCode,
+      lines: lines.map((line) => ({
+        variant_id: line.variantId,
+        barcode: line.barcode,
+        qty: line.qty.toFixed(4),
+        unit_price: line.unitPrice.toFixed(4),
+      })),
+      tenders: tenders.map((tender) => ({
+        method: tender.method,
+        currency: tender.currency,
+        amount_tendered: tender.amountTendered.toFixed(4),
+      })),
+    };
+
+    /** The outbox entry, in the exact shape the sync endpoint accepts. */
+    const queuedSale: Omit<OutboxSale, 'attempts' | 'nextAttemptAt' | 'lastError'> = {
+      clientSaleId,
+      shiftId,
+      warehouseId: warehouseId ?? '',
+      soldAt: new Date().toISOString(),
+      currency: 'USD',
+      lines: lines.map((line) => ({
+        variantId: line.variantId,
+        barcode: line.barcode,
+        qty: line.qty.toFixed(4),
+        unitPrice: line.unitPrice.toFixed(4),
+        promotionIds: [],
+      })),
+      tenders: tenders.map((tender) => ({
+        method: tender.method,
+        currency: tender.currency,
+        amountTendered: tender.amountTendered.toFixed(4),
+      })),
+    };
+
+    let response: Response;
     try {
-      const clientSaleId = crypto.randomUUID();
-      const response = await apiFetch('/api/pos/sales', {
+      response = await apiFetch('/api/pos/sales', {
         method: 'POST',
-        body: JSON.stringify({
-          warehouse_id: warehouseId,
-          shift_id: shiftId,
-          client_sale_id: clientSaleId,
-          tax_code: taxCode,
-          lines: lines.map((line) => ({
-            variant_id: line.variantId,
-            barcode: line.barcode,
-            qty: line.qty.toFixed(4),
-            unit_price: line.unitPrice.toFixed(4),
-          })),
-          tenders: tenders.map((tender) => ({
-            method: tender.method,
-            currency: tender.currency,
-            amount_tendered: tender.amountTendered.toFixed(4),
-          })),
-        }),
+        body: JSON.stringify(saleBody),
       });
+    } catch {
+      // The network is down. The sale is already complete from the customer's point of view, so
+      // it goes to the outbox rather than being lost. This is the offline path.
+      await enqueueSale(queuedSale);
+      setPending(await countPending());
+      setStatus('queued');
+      return;
+    }
 
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => ({}))) as { error?: string };
-        throw new Error(payload.error ?? `sale failed (${response.status})`);
+    if (!response.ok) {
+      // 429 (rate limited) and 5xx are transient: queue and let the sync loop retry. A 4xx like
+      // "insufficient stock" is a real refusal the cashier must see, so it is surfaced.
+      if (response.status === 429 || response.status >= 500) {
+        await enqueueSale(queuedSale);
+        setPending(await countPending());
+        setStatus('queued');
+        return;
       }
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      setStatus('error');
+      setError(payload.error ?? `sale failed (${response.status})`);
+      return;
+    }
 
+    try {
       const payload = (await response.json()) as {
         sale_id: string;
         invoice_no: string;
@@ -334,7 +414,7 @@ export default function PosPage() {
           return;
         }
 
-        if (status === 'paid' || status === 'error') {
+        if (status === 'paid' || status === 'queued' || status === 'error') {
           clear();
           return;
         }
@@ -452,6 +532,8 @@ export default function PosPage() {
         <div className="status">
           <span data-testid="actions">Actions {actions}</span>
           <span data-testid="status">{status}</span>
+          <span data-testid="pending">Pending {pending}</span>
+          {syncing && <span data-testid="syncing">syncing</span>}
           {error && <span className="error">{error}</span>}
         </div>
       </section>

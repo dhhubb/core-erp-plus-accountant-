@@ -21,7 +21,8 @@ with tenant_tables as (
       'categories', 'product_batches',
       'price_lists', 'price_list_items', 'customer_groups', 'promotions',
       'discount_limits', 'manual_discounts',
-      'shifts', 'pos_sales', 'pos_payments', 'pos_sale_keys'
+      'shifts', 'pos_sales', 'pos_payments', 'pos_sale_keys',
+      'pos_sync_exceptions'
     )
 ),
 cols as (

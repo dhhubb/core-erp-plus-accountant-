@@ -126,3 +126,28 @@ invoice and payment functions.
 * `app.open_shift(...)`, `app.list_pos_sales(...)`, `app.pos_sale_receipt(sale_id)`.
 * `POST /api/pos/sales`, `GET /api/pos/sales`, `GET /api/pos/shifts`, `POST /api/pos/shifts`, and
   `src/verticals/pos/*` (`sales.ts`, `cart.ts`, `api.ts`). The till at `/pos` is keyboard only.
+
+## R4 extension (Retail: offline outbox and sync)
+
+Additive, recorded in ADR-0015, ADR-0016 and ADR-0017. It does not change core accounting logic; a
+synced sale still calls the core invoice and payment functions.
+
+* New branch-scoped table: `pos_sync_exceptions` (where a synced sale that could not post strictly
+  is recorded, rather than refused).
+* `app.negative_stock_allowed()` — the transaction-local allow-negative hook (ADR-0015). Set only by
+  the sync retry, with `set_config('app.allow_negative_stock', 'on', true)`.
+* `app.sync_pos_sale(org_id, branch_id, warehouse_id, shift_id, client_sale_id, lines, tenders,
+  contact_id, sale_date, local_time, tax_code)` — one call per offline sale. Returns
+  `{ outcome: 'committed' | 'duplicate' | 'exception', receipt, exceptions }`. It never rejects a
+  completed sale: a duplicate returns the original receipt, a short-stock sale posts through the
+  hook, and a moved price or expired promotion is honoured and logged.
+* `app.consume_fifo` and `app.create_invoice` are re-created in
+  `20260101040000_pos_r4_offline_sync.sql` with the hook added to the availability guard. The
+  applied migration is untouched; the newest definition wins.
+* `POST /api/pos/sync` (up to 50 sales, one transaction each) and `src/verticals/pos/`:
+  `outbox.ts` (IndexedDB store, the client_sale_id generated at sale time, backoff),
+  `sync.ts` (the drain loop, one request in flight), `syncServer.ts` (per-sale transaction),
+  `rateLimit.ts` (live-sale limiter, Redis counters prefixed by org).
+* The live sale endpoint `POST /api/pos/sales` is rate limited to 30 sales/minute/cashier and
+  returns `429` with `Retry-After` past that. `POST /api/pos/sync` is exempt, so a backlog is never
+  throttled. Redis holds counters only; the ledger is unaffected.

@@ -1,5 +1,5 @@
 import Decimal from 'decimal.js';
-import { ApiError, parseCursor, parseLimit, withAuth } from '@/app/api/_lib';
+import { ApiError, RateLimitedError, jsonError, parseCursor, parseLimit, withAuth } from '@/app/api/_lib';
 import {
   createPosSale,
   listPosSales,
@@ -8,6 +8,7 @@ import {
   type PosSaleLineInput,
   type PosTenderInput,
 } from '@/verticals/pos/sales';
+import { checkLiveSaleLimit, redisCounterStore } from '@/verticals/pos/rateLimit';
 
 interface SaleBody {
   warehouse_id: string;
@@ -64,6 +65,17 @@ function serialise(receipt: Awaited<ReturnType<typeof createPosSale>>) {
 /** POST /api/pos/sales — ring a sale: CORE invoice + one CORE payment per tender, one transaction. */
 export async function POST(request: Request) {
   return withAuth(request, async ({ client, claims }) => {
+    // Live sales are rate limited per cashier (30/minute). The sync endpoint is exempt, because it
+    // carries a backlog of already-completed sales. Counters live in Redis and never in the ledger.
+    const limit = await checkLiveSaleLimit(redisCounterStore(), {
+      orgId: claims.orgId!,
+      branchId: claims.branchIds[0]!,
+      cashierId: claims.sub,
+    });
+    if (!limit.allowed) {
+      throw new RateLimitedError(limit.retryAfter);
+    }
+
     const body = (await request.json()) as SaleBody;
 
     if (!body.client_sale_id) {

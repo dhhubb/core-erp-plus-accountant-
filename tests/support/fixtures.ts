@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import type { AuthClaims } from '../../src/core/auth';
 import { one, sql } from './db';
 
@@ -8,6 +8,53 @@ export interface Tenant {
   userId: string;
   email: string;
   claims: AuthClaims;
+}
+
+function base64Url(input: Buffer | string): string {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+/**
+ * Mint a real HS256 Supabase-style access token carrying the tenant claims. Route handlers verify
+ * the signature, so a test that drives a handler needs a genuine token, not just a claims object.
+ */
+export function mintAccessToken(claims: {
+  sub: string;
+  orgId: string | null;
+  branchIds: string[];
+  email?: string;
+  ttlSeconds?: number;
+}): string {
+  const secret =
+    process.env.SUPABASE_JWT_SECRET ??
+    'super-secret-jwt-token-with-at-least-32-characters-long';
+  const header = base64Url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const payload = base64Url(
+    JSON.stringify({
+      sub: claims.sub,
+      role: 'authenticated',
+      ...(claims.email !== undefined ? { email: claims.email } : {}),
+      org_id: claims.orgId,
+      branch_ids: claims.branchIds,
+      exp: Math.floor(Date.now() / 1000) + (claims.ttlSeconds ?? 3600),
+    }),
+  );
+  const signature = createHmac('sha256', secret).update(`${header}.${payload}`).digest();
+  return `${header}.${payload}.${base64Url(signature)}`;
+}
+
+/** The bearer token for a tenant, as a request path would present it. */
+export function tenantToken(tenant: Tenant): string {
+  return mintAccessToken({
+    sub: tenant.userId,
+    orgId: tenant.orgId,
+    branchIds: tenant.claims.branchIds,
+    email: tenant.email,
+  });
 }
 
 function tokenFor(userId: string, orgId: string | null, branchIds: string[]): AuthClaims {

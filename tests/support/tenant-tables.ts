@@ -58,6 +58,8 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'pos_sales', scope: 'branch', highVolume: true, partitioned: true },
   { name: 'pos_payments', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'pos_sale_keys', scope: 'org', highVolume: false, partitioned: false },
+  // R4 (retail): offline outbox and sync.
+  { name: 'pos_sync_exceptions', scope: 'branch', highVolume: true, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -376,6 +378,13 @@ export async function seedOneRowPerTenantTable(
       where ps.org_id = $1
       limit 1`,
     [orgId, branchId],
+  );
+
+  // R4 (retail): offline outbox and sync.
+  await sql(
+    `insert into public.pos_sync_exceptions (org_id, branch_id, client_sale_id, kind, detail)
+     values ($1, $2, $3, 'negative_stock', '{"reason": "seed"}'::jsonb)`,
+    [orgId, branchId, randomUUID()],
   );
 
   return {

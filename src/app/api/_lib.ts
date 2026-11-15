@@ -13,8 +13,19 @@ export class ApiError extends Error {
   }
 }
 
-export function jsonError(status: number, message: string): NextResponse {
-  return NextResponse.json({ error: message }, { status });
+/** A rate-limited request. Carries Retry-After so the client knows when to try again. */
+export class RateLimitedError extends Error {
+  readonly status = 429;
+  readonly retryAfter: number;
+
+  constructor(retryAfter: number, message = 'too many sales in one minute') {
+    super(message);
+    this.retryAfter = retryAfter;
+  }
+}
+
+export function jsonError(status: number, message: string, headers?: Record<string, string>): NextResponse {
+  return NextResponse.json({ error: message }, { status, ...(headers ? { headers } : {}) });
 }
 
 /**
@@ -35,6 +46,9 @@ export async function withAuth<T>(
 }
 
 export function toErrorResponse(error: unknown): NextResponse {
+  if (error instanceof RateLimitedError) {
+    return jsonError(429, error.message, { 'retry-after': String(error.retryAfter) });
+  }
   if (error instanceof ApiError) {
     return jsonError(error.status, error.message);
   }
