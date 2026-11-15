@@ -10,7 +10,7 @@ Schema: plain SQL migrations in `supabase/migrations/` (no Prisma).
 |-----------|-------|------|-------|
 | M0 | Setup | build passes on empty app | DONE |
 | M1 | Tenancy (RLS, indexes, partitions) | tests 1–14 | DONE |
-| M2 | Accounting | tests 15–24 | todo |
+| M2 | Accounting | tests 15–24 | DONE |
 | M3 | Inventory | tests 25–31 | todo |
 | M4 | Sales & purchases + concurrency | tests 32–40 | todo |
 | M5 | Hardening (audit, checks, perf, README) | verification list | todo |
@@ -91,6 +91,26 @@ $ psql -f scripts/check-fk-indexes.sql
 $ psql -f scripts/check-tenant-tables.sql
 (0 rows)
 ```
+
+## M2 — Accounting
+
+`tests/accounting.test.ts` covers tests 15–24.
+
+```
+$ npx vitest run tests/accounting.test.ts
+ Test Files  1 passed (1)
+      Tests  10 passed (10)
+```
+
+* Balance check: `journal_lines_balance` is a `DEFERRABLE INITIALLY DEFERRED` constraint trigger
+  on the `journal_lines` parent; PG17 clones it onto every existing and future partition (ADR-0001).
+* A line carries either a debit or a credit (`journal_lines_single_sided_check`) and never a
+  negative value.
+* Closed periods: `app.assert_period_open` plus a BEFORE INSERT trigger on `journals`.
+* Rates: `app.rate_on` and `app.tax_rate_on` are effective-dated; each journal line stores the
+  rate it used, so later rate changes do not rewrite history.
+* Rounding: `post_journal` rounds base amounts to 4 dp per line and posts any residual to the
+  rounding account from `settings`.
 
 ## Notes / decisions recorded in docs/ADR.md
 
