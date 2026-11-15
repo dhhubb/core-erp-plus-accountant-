@@ -208,3 +208,32 @@ $ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql
 * ADR-0005 No summary table for the trial balance in Phase 1 (perf run is under 500 ms).
 * ADR-0006 Audit rows store the logical table name, not the partition.
 * ADR-0007 The perf seed spreads rows across organisations so the plan reflects production.
+
+## Phase 2 backlog — prompts written (not yet executed)
+
+The Phase 2 backlog has been turned into one prompt per item under `docs/phase2/`, each with its own
+milestones and gates. Nothing in Phase 2 has been executed; Phase 1 remains the current deliverable.
+
+| # | Item | Tests | Depends on |
+|---|------|-------|------------|
+| P2-01 | Rate limiting (Upstash Redis) | 41–44 | Phase 1 |
+| P2-02 | Low-stock alerts (indexed view) | 45–47 | Phase 1 |
+| P2-03 | Audit log viewer (read-only, paginated) | 48–50 | Phase 1 |
+| P2-04 | Settings cache (`unstable_cache`, invalidated on write) | 51–53 | Phase 1 |
+| P2-05 | Pharmacy readiness: lot/batch/expiry hooks (ADR) | 54–55 | Phase 1 |
+| P2-06 | Dashboard (`dashboard_stats` matview, pg_cron 2 min, <100 ms @ 1M rows) | 56–58 | Phase 1 |
+| P2-07 | Realtime (branch-scoped subscriptions) | 59–61 | Phase 1 |
+| P2-08 | Invite UI + org/branch switcher | 62–64 | Phase 1 |
+| P2-09 | Report summary tables | **conditional — gated OFF** | perf ADR triggered |
+| P2-10 | Hash sub-partitioning (`stock_ledger` by org) | **conditional — gated OFF** | measured need |
+| P2-11 | First vertical module: Retail | 69–75 | P2-05 |
+| P2-12 | Frontend vertical slices | 76–80 | P2-08 |
+
+Ordering rules applied from the backlog text: the pharmacy ADR (P2-05) precedes the first vertical
+module (P2-11); report summary tables (P2-09) run only if the Phase 1 perf ADR was triggered — it was
+not (ADR-0005); hash sub-partitioning (P2-10) runs only on measured need — none exists.
+
+Environment note: this session began on a recycled runtime (Docker down, Supabase CLI off `PATH`).
+The environment was restored (dockerd restarted, Supabase CLI v3.1.0 installed, local stack up) and
+all Phase 1 gates were re-verified on a clean database: `npm test` 40 passed (40), `npm run build`
+compiled successfully, `npm run lint` clean, both check scripts 0 rows.
