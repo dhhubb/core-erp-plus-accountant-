@@ -28,6 +28,7 @@ migrations, and Prisma usually connects as a role that bypasses RLS.
 - [Retail extension (R3)](#retail-extension-r3)
 - [Retail extension (R4)](#retail-extension-r4)
 - [Retail extension (R5)](#retail-extension-r5)
+- [Retail extension (R6)](#retail-extension-r6)
 - [Adding a vertical module](#adding-a-vertical-module)
 - [Tests, checks and the perf run](#tests-checks-and-the-perf-run)
 
@@ -250,6 +251,41 @@ erDiagram
         text count_no
         text status
     }
+    fiscal_device_integration {
+        uuid id PK
+        uuid org_id FK
+        uuid branch_id FK
+        text device_type
+        text mode
+        text status
+        timestamptz last_sync
+        jsonb payload
+        timestamptz created_at
+    }
+    fiscal_jobs {
+        uuid id PK
+        uuid org_id FK
+        uuid branch_id FK
+        uuid sale_id FK
+        uuid invoice_id FK
+        text status
+        jsonb payload
+        timestamptz created_at
+    }
+    fiscal_job_attempts {
+        uuid id PK
+        uuid org_id FK
+        uuid branch_id FK
+        uuid job_id FK
+        int attempt_no
+        text outcome
+        text error
+        timestamptz attempted_at
+        timestamptz created_at
+    }
+    branches ||--o| fiscal_device_integration : configures
+    branches ||--o{ fiscal_jobs : queues
+    fiscal_jobs ||--o{ fiscal_job_attempts : attempts
 ```
 
 ## Tenancy and RLS
@@ -543,6 +579,33 @@ three additive changes to core tables. See ADR-0019, ADR-0020 and ADR-0021.
   (`action: 'lines'`, `action: 'close'`), `GET/POST /api/z-reports`. Modules under
   `src/verticals/ops/`.
 
+## Retail extension (R6)
+
+R6 adds the fiscal integration adapter. It is additive: new tables, new functions, and one new
+trigger. See ADR-0022. It builds the **queue**, not the device — whether ZIMRA requires printing at
+the moment of sale is an open item in `docs/ADR.md`.
+
+- **Queue-only, mode per branch.** `fiscal_device_integration` holds one row per branch with the
+  device config and a `mode` of `none` or `async`. There is no `blocking` mode in this run; the
+  check constraint rejects any other value, so a blocking mode needs a new ADR and a new run.
+- **The sale path does one insert.** An `AFTER INSERT` trigger on the partitioned `pos_sales`
+  parent calls `app.enqueue_fiscal_job`, which inserts exactly one `fiscal_jobs` row when the branch
+  mode is `async`. It makes no network call and waits for nothing. A sale with mode `none`, or with
+  no integration row, is untouched and never errors. The trigger runs in the sale's own transaction,
+  so a committed sale has queued its job and a rolled-back sale has left none.
+- **Append-only, derived state.** `fiscal_jobs` and `fiscal_job_attempts` are immutable, like the
+  ledger: no UPDATE, no DELETE, and the privileges are revoked from `authenticated`. A job is born
+  `queued` and never changes; each delivery attempt appends a row, and a `sent` attempt marks the
+  job done. `unique (org_id, sale_id)` keeps "exactly one job per sale" true even when the enqueue
+  is retried.
+- **Backoff in SQL.** `app.fiscal_jobs_due` returns the queued, not-yet-sent jobs whose exponential
+  backoff (base 30s, capped 1h) has elapsed. An unreachable device records an `unreachable` attempt;
+  the job stays queued and becomes due again later. It is never dropped and never blocks anything.
+- **Endpoints.** `GET/PUT /api/fiscal/integration`, `GET /api/fiscal/jobs`, `POST /api/fiscal/drain`.
+  Modules under `src/fiscal/` (`adapter.ts` for the queue, `worker.ts` for delivery). The `drain`
+  route ships the unreachable transport, which performs no network call; a real device transport is
+  a future run.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -601,6 +664,8 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 | 45–48 | R2: pricing and promotions | `tests/retail-r2.test.ts` |
 | 9–13 | R3: online POS sale | `tests/pos-r3.test.ts`, `e2e/pos-keyboard.e2e.ts` |
 | 14–18 | R4: offline outbox and sync | `tests/pos-r4.test.ts`, `e2e/pos-offline.e2e.ts` |
+| 19–24 | R5: operations (laybys, returns, credit limits, Z-reports, stock counts) | `tests/ops-r5.test.ts` |
+| 25 | R6: fiscal integration adapter (queue-only) | `tests/fiscal-r6.test.ts` |
 
 Test 13 is the keyboard-only Playwright run and test 14 is the offline reload-and-reconnect run;
 both live in `e2e/`. The e2e config starts its own dev server on port 12100 with its own dist dir

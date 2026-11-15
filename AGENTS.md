@@ -103,11 +103,29 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
 * **`COPY FROM STDIN` needs a real stream.** `pg-copy-streams` `from(sql)` returns a writable
   stream; pipe a `Readable` into it and wait for `finish`. It is the import path for stock count
   lines.
+* **The fiscal adapter is queue-only, and the sale path does one insert.** An `AFTER INSERT`
+  trigger on the partitioned `pos_sales` parent (`app.fiscal_enqueue_on_sale`) calls
+  `app.enqueue_fiscal_job`, which inserts exactly one `fiscal_jobs` row when the branch mode is
+  `async`. No network call, no wait; mode `none` (or no integration row) queues nothing and never
+  errors. The trigger is in the sale's own transaction, so a rolled-back sale leaves no job
+  (ADR-0022).
+* **The fiscal queue is append-only; delivery state is derived.** `fiscal_jobs` and
+  `fiscal_job_attempts` go through `app.enforce_immutable`. A job is born `queued` and never
+  updated; each delivery attempt appends a row and a `sent` attempt marks the job done. `unique
+  (org_id, sale_id)` keeps "exactly one job per sale" true across retries.
+* **Backoff lives in SQL, not in the worker.** `app.fiscal_jobs_due` returns the queued,
+  not-yet-sent jobs whose exponential backoff (base 30s, capped 1h) has elapsed, so the worker
+  (`src/fiscal/worker.ts`) and the database agree on timing. An unreachable device records an
+  `unreachable` attempt and the job becomes due again later — never dropped, never blocking.
+* **There is no blocking fiscal mode, on purpose.** The mode check constraint is `mode in ('none',
+  'async')`. Whether ZIMRA requires printing at the moment of sale is an open item (ADR-0022); a
+  blocking mode is a separate future run with its own ADR. Nothing in R6 is a compliance claim.
 
 ## Test numbering
 
 Phase 1 owns 1–40. R1 owns 41–44 (`tests/retail-r1.test.ts`). R2 owns 45–48
 (`tests/retail-r2.test.ts`). R3 owns 9–13 (`tests/pos-r3.test.ts` plus the keyboard e2e). R4 owns
-14–18 (`tests/pos-r4.test.ts` plus the offline e2e). R5 owns 19–24 (`tests/ops-r5.test.ts`). A new
+14–18 (`tests/pos-r4.test.ts` plus the offline e2e). R5 owns 19–24 (`tests/ops-r5.test.ts`). R6
+owns 25 (`tests/fiscal-r6.test.ts`). A new
 run continues from the highest number actually present; ranges in `docs/phase2/README.md` are
 indicative only (ADR-0010).

@@ -24,7 +24,8 @@ with tenant_tables as (
       'shifts', 'pos_sales', 'pos_payments', 'pos_sale_keys',
       'pos_sync_exceptions',
       'credit_limits', 'laybys', 'layby_reservations', 'returns', 'return_lines',
-      'z_reports', 'stock_counts', 'stock_count_items'
+      'z_reports', 'stock_counts', 'stock_count_items',
+      'fiscal_device_integration', 'fiscal_jobs', 'fiscal_job_attempts'
     )
 ),
 cols as (

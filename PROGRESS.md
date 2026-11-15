@@ -595,3 +595,86 @@ Notes:
 * The `jsonb` payloads returned by the operations functions carry money as JSON numbers, so the
   tests read money from the ledger columns (`NUMERIC`), not from the payload. The route handlers
   format the payload values with `toFixed(4)`.
+
+## R6 — Fiscal integration adapter (queue-only)
+
+Status: **complete**. Gate evidence below.
+
+### What was built
+
+* `supabase/migrations/20260101060000_fiscal_r6.sql` (additive, see ADR-0022):
+  * `public.fiscal_device_integration` (org + branch; `device_type`, `mode` in (`none`, `async`),
+    `status`, `last_sync`, `payload` jsonb; `unique (org_id, branch_id)`).
+  * `public.fiscal_jobs` (org + branch; APPEND-ONLY job queue; `unique (org_id, sale_id)`;
+    index `(org_id, branch_id, status, created_at)` as the brief requires).
+  * `public.fiscal_job_attempts` (org + branch; APPEND-ONLY delivery attempts).
+  * `app.enqueue_fiscal_job(...)`, `app.fiscal_jobs_due(...)`, `app.record_fiscal_attempt(...)`.
+  * `app.fiscal_enqueue_on_sale()` — `AFTER INSERT` trigger on the partitioned `pos_sales` parent.
+    The only fiscal work on the sale path: one insert, in the sale's own transaction, no network
+    call, no wait. Mode `none` (or no integration row) queues nothing and never errors.
+* `src/fiscal/`: `types.ts`, `adapter.ts` (`enqueueFiscalJob`, integration get/set), `worker.ts`
+  (`drainFiscalJobs` / `drainFiscalJobsOn`, `unreachableTransport`), `index.ts`.
+* Thin routes: `src/app/api/fiscal/integration`, `src/app/api/fiscal/jobs`,
+  `src/app/api/fiscal/drain`.
+* `tests/fiscal-r6.test.ts` — test 25 plus five supporting tests.
+
+### Scope boundary
+
+This run builds the queue, not the device. There is **no blocking mode**: whether ZIMRA requires
+printing at the moment of sale is an open item recorded in `docs/ADR.md` (ADR-0022). Nothing here is
+a compliance claim. The tests check queueing and non-blocking behaviour only.
+
+### Test 25 (the R6 gate test)
+
+| # | Test |
+| --- | --- |
+| 25 | With mode async and device unreachable, the sale still commits and exactly one fiscal job is queued |
+
+Supporting tests in the same file (not filler; each pins a queue guarantee): mode `none` and no
+integration queue nothing; a retried sale queues one job; the enqueue is idempotent; the queue is
+append-only (UPDATE/DELETE rejected); a rolled-back sale leaves no job (the enqueue is in the sale
+transaction).
+
+### Gate evidence (R6)
+
+```
+$ supabase db reset
+Applying migration 20260101060000_fiscal_r6.sql...
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  10 passed (10)
+      Tests  71 passed (71)
+
+$ npx tsc --noEmit
+(clean)
+
+$ npm run build
+ ✓ Compiled successfully
+ ✓ Generating static pages (21/21)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ psql "$DATABASE_URL" -f scripts/check-fk-indexes.sql
+(0 rows)
+
+$ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql
+(0 rows)
+
+$ npx playwright test
+ 2 passed (21.6s)
+
+$ npm run test:perf
+Saved to docs/perf/trial-balance-<timestamp>.md
+```
+
+Notes:
+
+* `fiscal_device_integration`, `fiscal_jobs` and `fiscal_job_attempts` are registered in
+  `tests/support/tenant-tables.ts` and `scripts/check-tenant-tables.sql`, so the table-driven RLS
+  test (test 2), the FK-index check (test 9), the schema check (test 10) and the high-volume index
+  check (test 11) cover them without a special case.
+* The queue is append-only, so delivery state is derived from `fiscal_job_attempts`: a `sent`
+  attempt marks a job done and the job row is never updated. `app.fiscal_jobs_due` is the single
+  source of truth for the exponential backoff, so the worker and the database agree on timing.

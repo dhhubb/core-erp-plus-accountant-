@@ -69,6 +69,10 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'z_reports', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'stock_counts', scope: 'branch', highVolume: true, partitioned: true },
   { name: 'stock_count_items', scope: 'branch', highVolume: true, partitioned: false },
+  // R6 (fiscal): the queue-only fiscal integration adapter.
+  { name: 'fiscal_device_integration', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'fiscal_jobs', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'fiscal_job_attempts', scope: 'branch', highVolume: true, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -459,6 +463,32 @@ export async function seedOneRowPerTenantTable(
         system_qty, unit_cost)
      values ($1, $2, $3, $4, 1, $5, 9, 9, 1)`,
     [orgId, branchId, countId, countCreatedAt, productId],
+  );
+
+  // R6 (fiscal): the queue-only fiscal integration adapter.
+  await sql(
+    `insert into public.fiscal_device_integration
+       (org_id, branch_id, device_type, mode, status, payload)
+     values ($1, $2, 'generic_http', 'async', 'active', '{"endpoint": "https://seed.example.test"}'::jsonb)`,
+    [orgId, branchId],
+  );
+
+  const fiscalSale = await sql<{ id: string }>(
+    `select id from public.pos_sales where org_id = $1 limit 1`,
+    [orgId],
+  );
+
+  const fiscalJob = await sql<{ id: string }>(
+    `insert into public.fiscal_jobs (org_id, branch_id, sale_id, invoice_id, status, payload)
+     values ($1, $2, $3, $4, 'queued', '{"seed": true}'::jsonb) returning id`,
+    [orgId, branchId, fiscalSale[0]!.id, invoiceId],
+  );
+
+  await sql(
+    `insert into public.fiscal_job_attempts
+       (org_id, branch_id, job_id, attempt_no, outcome, error)
+     values ($1, $2, $3, 1, 'unreachable', 'seed')`,
+    [orgId, branchId, fiscalJob[0]!.id],
   );
 
   return {

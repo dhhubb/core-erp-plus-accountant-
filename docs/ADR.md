@@ -421,3 +421,53 @@ reviewable journal. The reservation is still an operational row: it is mutable (
 from `reserved` to `collected` or `released`), which is why it lives outside the immutable ledger
 and carries a mutable status rather than a reversing entry. `tests/ops-r5.test.ts` tests 19 to 21
 and 24 cover the deposit journal, collection, cancellation and the single count journal.
+
+## ADR-0022 — The fiscal adapter is queue-only, and blocking mode is an open item
+
+**Context.** R6 adds the fiscal integration adapter. The brief is explicit that the mode must not be
+chosen by assumption: if the ZIMRA rule requires printing at the moment of sale, the adapter must
+stop after the queue is built and the question must be recorded as an open item. The brief also
+requires that, beyond inserting a job row, the adapter never sits on the critical path of a sale.
+
+ADR-0003 already records that no ZIMRA-specific format or fiscal device integration was built in
+Phase 1. R6 builds the *queue*, not the device.
+
+**Decision.**
+
+1. **Queue-only, mode `none` or `async`.** `public.fiscal_device_integration` carries a per-branch
+   `mode` whose check constraint is `mode in ('none', 'async')`. There is deliberately **no
+   `blocking` mode** in this run. The constraint rejects any other value, so the decision cannot be
+   made by accident, and a blocking mode is a separate future run with its own ADR.
+2. **The sale path does one insert and nothing else.** An `AFTER INSERT` trigger on the partitioned
+   `pos_sales` parent (`app.fiscal_enqueue_on_sale`) calls `app.enqueue_fiscal_job`, which inserts
+   exactly one row into `public.fiscal_jobs` when the branch mode is `async`. It makes no network
+   call and waits for nothing. A sale with mode `none`, or with no integration row, is untouched and
+   never errors. Because the trigger runs in the sale's own transaction, a committed sale has queued
+   its job or has none to queue; a rolled-back sale leaves no job.
+3. **The queue is append-only, and delivery state is derived.** `public.fiscal_jobs` and
+   `public.fiscal_job_attempts` are passed through `app.enforce_immutable`, exactly like the ledger
+   tables: no UPDATE, no DELETE, and the privileges are revoked from `authenticated`. A job row is
+   born `queued` and never changes; each delivery attempt appends a row, and a `sent` attempt is what
+   marks a job done. `unique (org_id, sale_id)` on `fiscal_jobs` makes "exactly one job per sale"
+   hold even if the enqueue is retried.
+4. **Backoff lives in SQL.** `app.fiscal_jobs_due` returns the queued, not-yet-sent jobs whose
+   exponential backoff (base 30s, capped 1h) has elapsed, so the worker (`src/fiscal/worker.ts`) and
+   the database agree on when a job is next due. An unreachable device records an `unreachable`
+   attempt; the job stays queued and becomes due again later. It is never dropped and never blocks
+   anything else.
+
+**Consequence.** A sale never depends on the fiscal device: it commits whether or not the device can
+be reached, and whether or not the device exists. `tests/fiscal-r6.test.ts` test 25 proves that with
+mode `async` and an unreachable device the sale commits and exactly one job is queued, and the
+adapter tests check queueing and non-blocking behaviour only — never compliance.
+
+### Open item — does ZIMRA require printing at the moment of sale?
+
+This is **not** decided here, and the adapter stops short of it. If the ZIMRA rule turns out to
+require the fiscal receipt to be printed (or the device to acknowledge) *at the moment of sale*,
+then a **blocking mode** is needed: the sale would have to wait for the device before committing.
+That is a separate future run. It would add a `blocking` value to the mode constraint, a transport
+with a real timeout, and a decision about what a sale does when the device does not answer (refuse
+the sale, or fall back to `async`). None of that is built now, and nothing in this run should be read
+as a compliance claim. The numbering abstraction (`number_series` + `next_number()`, ADR-0003) and
+the job queue built here are the two places such a run would hook into.

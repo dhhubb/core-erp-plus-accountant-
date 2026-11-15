@@ -183,3 +183,29 @@ functions.
 * `GET/POST /api/laybys`, `/api/returns`, `/api/credit-limits`, `/api/stock-counts`, `/api/z-reports`
   and `src/verticals/ops/*` (`laybys.ts`, `returns.ts`, `credit.ts`, `stockCounts.ts`,
   `zReports.ts`).
+
+## R6 extension (Fiscal integration adapter)
+
+Additive, recorded in ADR-0022. It does not change core accounting logic. The adapter is **queue
+only**: a sale appends at most one job row, and a worker delivers jobs later. There is no blocking
+mode in this run — whether ZIMRA requires printing at the moment of sale is an **open item** in
+`docs/ADR.md`.
+
+* New branch-scoped tables: `fiscal_device_integration` (per-branch device config and `mode`:
+  `none` or `async`), `fiscal_jobs` (APPEND-ONLY job queue; `unique (org_id, sale_id)`),
+  `fiscal_job_attempts` (APPEND-ONLY delivery attempts).
+* `app.enqueue_fiscal_job(org_id, branch_id, sale_id, invoice_id)` — inserts exactly one job when
+  the branch mode is `async`, and nothing otherwise. Idempotent per `(org_id, sale_id)`.
+* `app.fiscal_enqueue_on_sale()` — the `AFTER INSERT` trigger on the partitioned `pos_sales`
+  parent. It is the only fiscal work on the sale path: one insert, in the sale's own transaction,
+  no network call and no wait.
+* `app.fiscal_jobs_due(org_id, branch_id, now, limit, base_seconds, max_seconds)` — the queued,
+  not-yet-sent jobs whose exponential backoff has elapsed (base 30s, capped 1h). Delivery state is
+  derived from `fiscal_job_attempts`, so a job row is never updated.
+* `app.record_fiscal_attempt(org_id, branch_id, job_id, outcome, error)` — appends one delivery
+  attempt (`sent`, `failed` or `unreachable`); the job row is locked `FOR UPDATE` while the attempt
+  number is computed.
+* TypeScript: `src/fiscal/` (`types.ts`, `adapter.ts`, `worker.ts`, `index.ts`).
+  `enqueueFiscalJob` queues a job; `drainFiscalJobs` / `drainFiscalJobsOn` run a delivery pass;
+  `unreachableTransport()` reports `unreachable` without any network call.
+* Endpoints: `GET/PUT /api/fiscal/integration`, `GET /api/fiscal/jobs`, `POST /api/fiscal/drain`.
