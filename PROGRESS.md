@@ -12,7 +12,7 @@ Schema: plain SQL migrations in `supabase/migrations/` (no Prisma).
 | M1 | Tenancy (RLS, indexes, partitions) | tests 1–14 | DONE |
 | M2 | Accounting | tests 15–24 | DONE |
 | M3 | Inventory | tests 25–31 | DONE |
-| M4 | Sales & purchases + concurrency | tests 32–40 | todo |
+| M4 | Sales & purchases + concurrency | tests 32–40 | DONE |
 | M5 | Hardening (audit, checks, perf, README) | verification list | todo |
 
 ## M0 — Setup
@@ -133,6 +133,31 @@ $ npx vitest run tests/inventory.test.ts
   transaction.
 * SKUs come from `number_series` via `app.next_number` (locked `FOR UPDATE`), never from a
   Postgres sequence.
+
+## M4 — Sales and purchases
+
+`tests/sales.test.ts` covers tests 32–40.
+
+```
+$ npx vitest run
+ Test Files  4 passed (4)
+      Tests  40 passed (40)
+```
+
+* Business logic is in SQL: `app.create_invoice`, `app.allocate_payment`, `app.create_credit_note`,
+  `app.post_receipt`, `app.post_stock_adjustment`. Route handlers (`src/app/api/**`) only parse the
+  request, call one function inside a user-scoped transaction, and serialise the result.
+* `create_invoice` takes a gapless number from `number_series` (`FOR UPDATE`) inside its own
+  transaction, so a rollback does not consume a number.
+* `app.allocate_payment` locks the invoice `FOR UPDATE` and refuses an amount above the open
+  balance.
+* `app.create_credit_note` returns stock as a new inbound layer at the invoice line's original FIFO
+  cost and posts a reversing journal.
+* Listing: `app.list_invoices` keysets on `(created_at, id)` with an explicit column list. The
+  default limit is 50 and the maximum is 100; anything else raises. `app.invoice_lines_for(uuid[])`
+  batches child rows with `= ANY($1)`.
+* Concurrency: `app.lock_stock_balances` sorts keys, so invoices that touch the same products in
+  opposite order cannot deadlock.
 
 ## Notes / decisions recorded in docs/ADR.md
 

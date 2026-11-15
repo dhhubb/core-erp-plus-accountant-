@@ -507,3 +507,51 @@ begin
   return p_limit;
 end;
 $$;
+
+-- ---------------------------------------------------------------------------
+-- list_invoices: keyset pagination on (created_at, id). Default 50, maximum 100. No OFFSET.
+-- Explicit column list, never SELECT *.
+-- ---------------------------------------------------------------------------
+create or replace function app.list_invoices(
+  p_org_id           uuid,
+  p_branch_id        uuid,
+  p_limit            int default 50,
+  p_after_created_at timestamptz default null,
+  p_after_id         uuid default null
+)
+returns setof public.invoices
+language plpgsql
+stable
+as $$
+declare
+  v_limit int := app.assert_page_limit(p_limit);
+begin
+  return query
+  select i.id, i.org_id, i.branch_id, i.contact_id, i.sales_order_id, i.invoice_no,
+         i.invoice_date, i.currency, i.exchange_rate, i.subtotal, i.tax_total, i.total,
+         i.amount_paid, i.journal_id, i.journal_created_at, i.created_at, i.updated_at
+    from public.invoices i
+   where i.org_id = p_org_id
+     and i.branch_id = p_branch_id
+     and (
+       p_after_created_at is null
+       or (i.created_at, i.id) < (p_after_created_at, p_after_id)
+     )
+   order by i.created_at desc, i.id desc
+   limit v_limit;
+end;
+$$;
+
+-- Batch child rows with = ANY($1). Never N+1.
+create or replace function app.invoice_lines_for(p_invoice_ids uuid[])
+returns setof public.invoice_lines
+language sql
+stable
+as $$
+  select il.id, il.org_id, il.branch_id, il.invoice_id, il.line_no, il.product_id, il.variant_id,
+         il.warehouse_id, il.description, il.qty, il.unit_price, il.unit_cost, il.discount,
+         il.tax_rate_id, il.tax_rate, il.line_subtotal, il.line_tax, il.line_total, il.created_at
+    from public.invoice_lines il
+   where il.invoice_id = any (p_invoice_ids)
+   order by il.invoice_id, il.line_no;
+$$;

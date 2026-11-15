@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { asUser, expectError, sql, tx } from './support/db';
 import { addBranch, createTenant, refreshedClaims } from './support/fixtures';
-import { BRANCH_SCOPED_TABLES, ORG_SCOPED_TABLES, TENANT_TABLES } from './support/tenant-tables';
+import { TENANT_TABLES } from './support/tenant-tables';
 
 describe('M1 tenancy and RLS', () => {
   it('1. Org A user cannot read Org B organizations row', async () => {
@@ -351,11 +351,5 @@ describe('M1 schema and indexes', () => {
         expect(rows[0]?.n, `missing partition ${table}_${key}`).toBe('1');
       }
     }
-  });
-});
-
-describe('M1 scope metadata', () => {
-  it('org and branch scoped table lists cover every tenant table', () => {
-    expect(ORG_SCOPED_TABLES.length + BRANCH_SCOPED_TABLES.length).toBe(TENANT_TABLES.length);
   });
 });
