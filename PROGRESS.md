@@ -381,7 +381,8 @@ What shipped:
   `client_sale_id`. `app.open_shift` and `app.list_pos_sales` alongside it.
 * `src/verticals/pos/` — `sales.ts` (typed wrappers), `cart.ts` (Zustand cart, decimal money),
   `api.ts` (bearer-token fetch). `src/app/api/pos/sales` and `src/app/api/pos/shifts` thin routes.
-* `/pos` keyboard-only till, 58mm browser receipt, `docs/pos-keys.md`.
+* `/pos` keyboard-only till, 58mm browser receipt, `docs/pos-keys.md`. `npm run db:seed-demo` seeds
+  a demo tenant and prints an access token so the receipt can be checked by hand.
 
 Gate evidence:
 

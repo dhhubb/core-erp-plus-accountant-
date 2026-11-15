@@ -34,3 +34,31 @@ events and asserts the counter reads 3 and a receipt with an invoice number appe
 The receipt is rendered in the browser (no server call) at 58mm. `@page { width: 58mm }` sizes the
 paper, and `@media print` hides the till chrome so only the receipt prints. It shows the lines, the
 VAT breakdown by rate, the tenders with change, and the CORE invoice number.
+
+## Checking the receipt by hand
+
+The till talks to the API with a user access token, and there is no sign-in UI in this phase, so a
+manual run needs a token in `localStorage`. Seed a tenant (any test fixture does this, or use an org
+you already have) and mint a token with the same claims the custom access token hook would add:
+
+```bash
+node -e '
+  const {createHmac}=require("crypto");
+  const b=(x)=>Buffer.from(x).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+  const secret=process.env.SUPABASE_JWT_SECRET||"super-secret-jwt-token-with-at-least-32-characters-long";
+  const h=b(JSON.stringify({alg:"HS256",typ:"JWT"}));
+  const p=b(JSON.stringify({sub:"<user id>",role:"authenticated",org_id:"<org id>",branch_ids:["<branch id>"],exp:Math.floor(Date.now()/1000)+3600}));
+  console.log(`${h}.${p}.${b(createHmac("sha256",secret).update(`${h}.${p}`).digest())}`);
+'
+```
+
+Then, in the browser console on `/pos`:
+
+```js
+localStorage.setItem('pos_access_token', '<the token>'); location.reload();
+```
+
+Scan or type a seeded barcode, press Enter, press F9, press Enter. The receipt appears on the right;
+`Ctrl+P` (or the browser's print dialog) shows the 58mm layout. `npm run test:e2e` performs the same
+three actions headlessly and asserts the printed total.
+

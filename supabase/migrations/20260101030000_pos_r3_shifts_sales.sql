@@ -258,6 +258,7 @@ declare
   v_line          jsonb;
   v_variant_id    uuid;
   v_product_id    uuid;
+  v_description   text;
   v_qty           numeric(19, 4);
   v_unit_price    numeric(19, 4);
   v_inv_lines     jsonb := '[]'::jsonb;
@@ -317,12 +318,14 @@ begin
 
     if v_line ? 'variant_id' and (v_line ->> 'variant_id') is not null then
       v_variant_id := (v_line ->> 'variant_id')::uuid;
-      select pv.product_id into v_product_id
+      select pv.product_id, p.name into v_product_id, v_description
         from public.product_variants pv
+        join public.products p on p.id = pv.product_id
        where pv.id = v_variant_id and pv.org_id = p_org_id;
     else
-      select pv.id, pv.product_id into v_variant_id, v_product_id
+      select pv.id, pv.product_id, p.name into v_variant_id, v_product_id, v_description
         from public.product_variants pv
+        join public.products p on p.id = pv.product_id
        where pv.org_id = p_org_id
          and pv.barcode = (v_line ->> 'barcode')
        limit 1;
@@ -349,6 +352,7 @@ begin
       'product_id', v_product_id,
       'variant_id', v_variant_id,
       'warehouse_id', p_warehouse_id,
+      'description', coalesce(v_line ->> 'description', v_description),
       'qty', v_qty,
       'unit_price', v_unit_price,
       'tax_rate_code', p_tax_code
