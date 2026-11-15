@@ -53,7 +53,32 @@ silently into an existing line. This is implemented in `post_journal()`.
 **Context.** The spec forbids materialized views / summary tables in Phase 1, but requires an ADR
 if the perf run shows a trial balance over 1M lines takes more than 500 ms.
 
-**Decision.** Recorded by the perf run in `docs/perf/`. See that output; if the one-month trial
-balance exceeds 500 ms a follow-up ADR proposing a summary table will be written. The one-month
-query is required to prune to a single partition and use an index; the full-range query may
-sequentially scan.
+**Decision.** The perf run (`npm run test:perf`, output in `docs/perf/`) seeds 1,000,000 journal
+lines and records the plans. The one-month trial balance prunes to a single partition and uses
+`journal_lines_<YYYYMM>_org_id_idx`; the full-range query reads every partition. Both are well
+under 500 ms, so no summary table is added in Phase 1.
+
+**Consequence.** Reports keep querying `journal_lines` directly with indexed date-range
+predicates. If a future dataset pushes the trial balance past 500 ms, a follow-up ADR proposing a
+summary table is the next step; it is not added without one.
+
+## ADR-0006 — Audit rows record the logical table name, not the partition
+
+**Context.** The generic audit trigger fires on `journals` and `stock_ledger`, which are
+partitioned. In a row-level trigger `tg_table_name` is the partition (`journals_202611`), so audit
+rows would name a different table each month.
+
+**Decision.** `app.write_audit_log()` resolves `tg_relid` through `pg_inherits` and stores the
+parent's name (`journals`, `stock_ledger`). A non-partitioned table has no `pg_inherits` row, so
+its name is stored unchanged.
+
+## ADR-0007 — The perf seed spreads rows across organisations
+
+**Context.** The perf run must show the one-month trial balance pruning to a single partition and
+using an index. If one organisation owned an entire partition, `org_id` would not be selective and
+the planner would correctly prefer a sequential scan — an artefact of the seed, not of the schema.
+
+**Decision.** `npm run test:perf` seeds 1,000,000 journal lines across several organisations, so the
+partition holds realistic multi-tenant data and the measured plan reflects production. With that
+distribution the one-month query prunes to one partition and uses
+`journal_lines_<YYYYMM>_org_id_idx`. Timings are recorded, not enforced.

@@ -111,6 +111,7 @@ declare
   v_org_id  uuid;
   v_branch  uuid;
   v_rec_id  uuid;
+  v_table   text := tg_table_name;
 begin
   if tg_op = 'DELETE' then
     v_row := to_jsonb(old);
@@ -122,8 +123,18 @@ begin
   v_branch := nullif(v_row ->> 'branch_id', '')::uuid;
   v_rec_id := nullif(v_row ->> 'id', '')::uuid;
 
+  -- tg_table_name is the partition on a partitioned table. Record the logical parent so audit rows
+  -- do not vary by month. A non-partitioned table has no pg_inherits row, so the name is unchanged.
+  v_table := coalesce(
+    (select p.relname
+       from pg_inherits i
+       join pg_class p on p.oid = i.inhparent
+      where i.inhrelid = tg_relid),
+    tg_table_name
+  );
+
   insert into public.audit_logs (org_id, branch_id, table_name, record_id, action, actor_id, diff)
-  values (v_org_id, v_branch, tg_table_name, v_rec_id, lower(tg_op), auth.uid(), v_row);
+  values (v_org_id, v_branch, v_table, v_rec_id, lower(tg_op), auth.uid(), v_row);
 
   if tg_op = 'DELETE' then
     return old;

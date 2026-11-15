@@ -1,6 +1,13 @@
 {
-  "extends": "next/core-web-vitals",
+  "root": true,
+  "extends": ["next/core-web-vitals"],
   "ignorePatterns": ["node_modules", ".next", "dist", "supabase/**"],
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaVersion": "latest",
+    "sourceType": "module"
+  },
+  "plugins": ["@typescript-eslint"],
   "overrides": [
     {
       "files": ["src/accounting/**/*.ts", "src/accounting/**/*.tsx"],

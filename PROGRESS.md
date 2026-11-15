@@ -13,7 +13,7 @@ Schema: plain SQL migrations in `supabase/migrations/` (no Prisma).
 | M2 | Accounting | tests 15–24 | DONE |
 | M3 | Inventory | tests 25–31 | DONE |
 | M4 | Sales & purchases + concurrency | tests 32–40 | DONE |
-| M5 | Hardening (audit, checks, perf, README) | verification list | todo |
+| M5 | Hardening (audit, checks, perf, README) | verification list | DONE |
 
 ## M0 — Setup
 
@@ -159,6 +159,45 @@ $ npx vitest run
 * Concurrency: `app.lock_stock_balances` sorts keys, so invoices that touch the same products in
   opposite order cannot deadlock.
 
+## M5 — Hardening
+
+Verification list, all green:
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  4 passed (4)
+      Tests  40 passed (40)
+
+$ npm run build
+ ✓ Compiled successfully
+   Linting and checking validity of types ...
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ psql "$DATABASE_URL" -f scripts/check-fk-indexes.sql
+(0 rows)
+
+$ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+* Audit: `app.write_audit_log()` writes `audit_logs` for invoices, payments, journals, products and
+  stock_ledger (receipts and adjustments). It stores the logical table name, not the partition
+  (ADR-0006). Nothing on a request path reads it.
+* `scripts/check-fk-indexes.sql` and `scripts/check-tenant-tables.sql` both return zero rows.
+* `npm run test:perf` seeds 1,000,000 journal lines with `generate_series` inside SQL and writes
+  `docs/perf/trial-balance-<timestamp>.md`. The one-month trial balance prunes to a single partition
+  and uses `journal_lines_<YYYYMM>_org_id_idx`; the full-range query reads every partition and may
+  sequentially scan. Timings are recorded, not enforced (ADR-0005, ADR-0007).
+* The no-any rule for `src/accounting/**` is enforced by an ESLint override
+  (`@typescript-eslint/no-explicit-any: error`); `npm run lint` fails if `any` appears there.
+* `README.md` documents the Mermaid ER diagram, the indexing strategy, how to run
+  `ensure_partitions`, how to add a vertical module, and the token-refresh note.
+
 ## Notes / decisions recorded in docs/ADR.md
 
 * ADR-0001 Deferred balance-check trigger on the partitioned `journals` parent (PG17 clones the
@@ -166,3 +205,6 @@ $ npx vitest run
 * ADR-0002 ZWG seeded as the Zimbabwe currency code (ZWL open item).
 * ADR-0003 ZIMRA fiscalisation format unknown — not built this phase.
 * ADR-0004 Rounding residual posts to the rounding account from settings, never dropped.
+* ADR-0005 No summary table for the trial balance in Phase 1 (perf run is under 500 ms).
+* ADR-0006 Audit rows store the logical table name, not the partition.
+* ADR-0007 The perf seed spreads rows across organisations so the plan reflects production.
