@@ -792,6 +792,8 @@ path changes. ADR-0028 to ADR-0034.
 * Status page `/branch/sync` (`src/app/branch/sync/page.tsx`).
 * Nightly encrypted backup: `src/sync/backup.ts` and `scripts/branch-backup.ts`
   (`npm run branch:backup`).
+* Sync loop: `scripts/branch-sync-loop.ts` (`npm run branch:sync`) drives the push+pull runner on a
+  timer until stopped.
 
 ### The H2 tests
 

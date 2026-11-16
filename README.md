@@ -689,6 +689,15 @@ from the cloud (a 4xx that names events) is a conflict. `src/sync/retry.ts`.
 so it answers with the cloud offline: outbox depth, last push and pull, the cloud observation, and
 the newest conflicts.
 
+**The loop.** `npm run branch:sync` runs the push+pull runner on a timer (`SYNC_INTERVAL_MS`,
+default 15s) until stopped. A tick that cannot reach the cloud backs off and the branch keeps
+selling; with no `CLOUD_URL` set the tick is a no-op, which is a valid offline state.
+
+```bash
+BRANCH_MODE=branch BRANCH_ORG_ID=<org> BRANCH_ID=<branch> CLOUD_URL=https://cloud.example \
+  npm run branch:sync
+```
+
 **Nightly encrypted backup.** `npm run branch:backup` dumps the branch's Postgres, encrypts it with
 AES-256-GCM (`BRANCH_BACKUP_KEY`) in memory, uploads only the ciphertext (a presigned URL when
 `BRANCH_BACKUP_UPLOAD_URL` is set, else `BRANCH_BACKUP_DIR`), and records the run in
