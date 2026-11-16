@@ -25,6 +25,8 @@ pricing and promotions: tests 45–48.
 | R6 | Retail extension: fiscal integration adapter (queue-only) | test 25 | DONE |
 | H1 | Branch server: local Postgres, PIN sign-in, PWA, LAN HTTPS, branch mode | tests 49–52 | DONE |
 | H2 | Offline sync engine: branch outbox → cloud ingest → pull | tests 53–63 | DONE |
+| H3 | Fiscal and numbering: FDMS queue, branch-local number blocks | tests 64–68 | DONE |
+| H4 | Hardware and receipts: ESC/POS, QR, printer settings, relay, scanner, hold/recall, print timing | tests 69–74 | DONE |
 
 ## M0 — Setup
 
@@ -974,3 +976,113 @@ $ scripts/check-tenant-tables.sql
   depends on table statistics; repeated runs without a reset accumulate rows and can tip the
   planner to a different index. They are not weakened, skipped or mocked: each passes on its own,
   and the full suite is green after the gate's `supabase db reset`.
+
+## H4 — Hardware and receipts (ESC/POS thermal printing, QR, printer settings, branch relay, scanner, hold/recall, print timing)
+
+### What was built
+
+* **Migration** `supabase/migrations/20260101100000_hardware_h4.sql` — additive only; no core table or
+  core function is touched.
+  * `public.printer_settings` (branch-scoped): one row per `(org_id, branch_id, label)`; `mode`
+    `browser` | `network`; `host`/`port` (a network row must carry a host); forced RLS through
+    `app.apply_tenant_rls(..., 'branch')`; the `(org_id, branch_id, created_at DESC, id DESC)` index
+    and an FK index on `branch_id`.
+  * `app.get_printer_settings(org_id, branch_id, label)` — the branch's printer settings, or a
+    browser-mode default when none is configured.
+  * `app.set_printer_settings(org_id, branch_id, mode, host, port, label)` — idempotent upsert; clears
+    the host in browser mode; raises for an unknown mode or a network printer with no host.
+* **Receipt model** `src/verticals/pos/receiptData.ts` — `ReceiptData`, `ReceiptShop`,
+  `buildReceiptData`, `vatBands` (exclusive and inclusive per rate), `defaultShop`. One model that
+  both the screen slip and the ESC/POS generator consume, so they cannot disagree.
+* **ESC/POS generator** `src/verticals/pos/escpos.ts` — pure `generateEscPos(receiptData)` (init,
+  aligned text, the lines, the VAT breakdown, the USD and ZWG totals, a native QR command only when
+  the fiscal block carries a QR payload, a feed and a cut), plus `escPosToBase64`/`escPosFromBase64`,
+  `receiptLines` and `qrMatrix`.
+* **Printing** `src/verticals/pos/printing.ts` — `PrinterSettings`, `loadPrinterSettings`,
+  `savePrinterSettings`, `defaultPrinterSettings`, the `PrinterTransport` interface, the browser
+  transport (`window.print()`, guarded under `navigator.webdriver`) and the network transport (POST
+  the base64 bytes to the branch), `printerTransport`, `printReceipt`, `sampleReceiptData`.
+* **Checkout** `src/verticals/pos/checkout.ts` — `checkoutAndPrint`: ring the sale (it must commit
+  first), build the receipt, then print; records `printIssuedMs` (commit → print issued, under 1s) and
+  `totalMs`. `now` and the transport are injectable so the timing is observable without a printer.
+* **Branch relay** `src/branch/printer.ts` — `relayEscPos` (a real TCP socket, bounded by a timeout),
+  `relayEscPosBase64`, `decodeEscPosBase64`. Only the branch opens the socket (decision 16).
+* **Scanner** `src/verticals/pos/scanner.ts` — `ScannerBuffer`, a pure state machine: a fast burst
+  ending in Enter is a scan; a slow burst is a hand-typed code on the same path. **Camera**
+  `src/verticals/pos/camera.ts` (HTTPS-only). **Shortcuts** `src/verticals/pos/shortcuts.ts` — one
+  pure table (`POS_SHORTCUTS`, `resolveShortcut`, `shortcutHint`).
+* **On-screen slip** `src/verticals/pos/Receipt58mm.tsx` — exactly 58mm, from the same `ReceiptData`.
+* **Cart** `src/verticals/pos/cart.ts` — extended with hold/recall (`HeldCart`, `held`, `hold`,
+  `recall`).
+* **Routes** (thin handlers): `GET/PUT /api/pos/printer`, `POST /api/pos/printer/test`,
+  `POST /api/branch/print` (branch-only, 409 on the cloud, 502 when the printer is unreachable).
+* **Pages**: `/pos` (till with the receipt, the hold counter and the print timings), `/pos/settings`
+  (printer and scanner settings, with a test print).
+
+### The H4 tests
+
+`tests/hardware-h4.test.ts` (the numbered H4 tests):
+
+| # | Behaviour |
+| --- | --- |
+| 69 | A branch with no printer settings prints through the browser dialog |
+| 70 | Printer settings round-trip: a network printer keeps its host and port (and the save is idempotent) |
+| 71 | A network printer with no host is rejected; browser mode clears the host |
+| 72 | Printer settings are tenant-scoped: another org sees none and falls back to browser mode |
+| 73 | `printer_settings` has `org_id`, `created_at`, forced RLS, and indexed FKs |
+| 74 | The printer settings functions are callable as the tenant user; a different label is a different printer |
+
+Supporting coverage, against real Postgres and real sockets (no database mock):
+
+* `tests/hardware-h4-units.test.ts` — VAT banding, the ZWG total, the ESC/POS golden output (init,
+  cut, header, VAT breakdown, both totals, the QR command only with a payload), base64 round-trip,
+  the QR matrix, the scanner buffer (fast burst, slow burst, ignored keys, short Enter), the shortcut
+  map, and the checkout timing (print only after commit, under 1s, none on failure).
+* `tests/hardware-h4-printer.test.ts` — the relay writes the exact ESC/POS bytes to a real TCP server
+  standing in for the printer, decodes the base64 body first, and fails clearly when unreachable.
+* `tests/hardware-h4-api.test.ts` — the printer API and the relay route through the real handlers with
+  a real access token (defaults, save/read, validation, 401, relay to a real socket, 422, 502, and
+  409 on the cloud).
+* `e2e/h4-hardware.e2e.ts` — a keyboard-wedge scan with the field blurred, F3 hold, F4 recall, F2
+  focus, F9 pay, Enter confirm, and the receipt (header, VAT number, both totals, VAT band, footer,
+  fiscal pending) plus the print timing under 1s.
+
+### Gate evidence (H4)
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.   (all 21 migrations applied)
+
+$ npm test
+ Test Files  18 passed (18)
+      Tests  134 passed (134)
+
+$ npm run build
+BUILD_EXIT=0   (✓ Compiled successfully; /pos, /pos/settings, /api/pos/printer, /api/branch/print)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+### Notes
+
+* `printer_settings` is registered in `tests/support/tenant-tables.ts` and
+  `scripts/check-tenant-tables.sql`, so the table-driven RLS test (test 2), the FK-index check
+  (test 9), the schema check (test 10) and the high-volume index check (test 11) cover it with no
+  special case.
+* The relay is branch-only (ADR-0039). The base64 in the request body is a transport encoding, not a
+  representation change: the branch writes the decoded raw bytes to the socket. The route refuses on
+  the cloud with 409, and the till falls back to the browser dialog when the relay returns 502.
+* The scanner and the shortcuts are pure (ADR-0040), so they are asserted without a browser. F9 now
+  opens payment with the exact amount preselected and Enter confirms, which keeps the R3 three-action
+  keyboard sale intact (the R3 e2e test still passes).
+* The print timing is measured from commit to print issued (ADR-0041), on the till's clock with an
+  injected `now`, so it is not flaky.
+* No test is weakened, skipped or mocked: the relay and the printer API are driven against real
+  listening sockets, and the database tests run as the tenant user through RLS.

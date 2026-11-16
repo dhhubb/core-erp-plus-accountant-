@@ -2,11 +2,22 @@
 
 import Decimal from 'decimal.js';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiFetch } from '@/verticals/pos/api';
+import { apiFetch, apiJson } from '@/verticals/pos/api';
 import { enqueueSale, countPending, type OutboxSale } from '@/verticals/pos/outbox';
 import { syncOnce } from '@/verticals/pos/sync';
 import { RegisterServiceWorker } from '@/branch/RegisterServiceWorker';
 import { useBranchHealth, type BranchHealthState } from '@/branch/useBranchHealth';
+import { Receipt58mm } from '@/verticals/pos/Receipt58mm';
+import { buildReceiptData, defaultShop } from '@/verticals/pos/receiptData';
+import { checkoutAndPrint, type CheckoutTimings } from '@/verticals/pos/checkout';
+import {
+  defaultPrinterSettings,
+  loadPrinterSettings,
+  type PrinterSettings,
+} from '@/verticals/pos/printing';
+import { ScannerBuffer } from '@/verticals/pos/scanner';
+import { resolveShortcut, shortcutHint } from '@/verticals/pos/shortcuts';
+import { cameraSupported, startCameraScan, type CameraScanner } from '@/verticals/pos/camera';
 import {
   cartTotals,
   remainingBase,
@@ -17,11 +28,15 @@ import {
 } from '@/verticals/pos/cart';
 
 /**
- * The till. Keyboard only: a scanner types the barcode and presses Enter (one action), F9 tenders
- * exact cash, Enter confirms and prints. A one-item exact-cash sale is three actions.
+ * The till (H4).
  *
- * The action counter is shown on screen so the flow is observable, and it is what the Playwright
- * keyboard test asserts.
+ * Keyboard only. A keyboard-wedge scanner types the barcode and presses Enter; the till reads the
+ * keystrokes directly, so a scan is one action no matter what has focus. Shortcuts: F2 focuses the
+ * scan field, F3 parks the cart (hold), F9 opens payment with the exact amount preselected and Enter
+ * confirms. A one-item exact-cash sale is still three actions: scan, F9, Enter.
+ *
+ * Printing happens after the sale commits: the receipt is rendered at 58mm and printed through the
+ * browser dialog or relayed to a network printer by the branch (see `printing.ts`).
  */
 
 const ZWG_SEED_RATE = new Decimal('30');
@@ -43,6 +58,7 @@ export default function PosPage() {
   const {
     lines,
     tenders,
+    held,
     actions,
     status,
     error,
@@ -55,6 +71,8 @@ export default function PosPage() {
     setStatus,
     setError,
     setReceipt,
+    hold,
+    recall,
     clear,
   } = useCart();
 
@@ -68,16 +86,24 @@ export default function PosPage() {
   const [selected, setSelected] = useState(0);
   const [pending, setPending] = useState(0);
   const [syncing, setSyncing] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [payOpen, setPayOpen] = useState(false);
+  const [printer, setPrinter] = useState<PrinterSettings>(defaultPrinterSettings());
+  const [timings, setTimings] = useState<CheckoutTimings | null>(null);
+  const [cameraOn, setCameraOn] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [shopName] = useState(defaultShop().name);
 
-  // The branch's connectivity, polled from the branch rather than read from navigator.onLine.
-  // A shop LAN with the internet down shows "cloud offline" even though the browser is "online".
+  const inputRef = useRef<HTMLInputElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const cameraRef = useRef<CameraScanner | null>(null);
+  const scannerRef = useRef(new ScannerBuffer());
+  const busyRef = useRef(false);
+
   const health = useBranchHealth();
 
   const totals = useMemo(() => cartTotals(lines), [lines]);
   const remaining = useMemo(() => remainingBase(lines, tenders, zwgRate), [lines, tenders, zwgRate]);
 
-  /** Exact cash for the remaining balance, in the requested currency. */
   const exactCash = useCallback(
     (currency: 'USD' | 'ZWG'): Decimal =>
       currency === 'USD'
@@ -86,34 +112,41 @@ export default function PosPage() {
     [remaining, zwgRate],
   );
 
-  // Load the terminal context: the open shift, the branch's warehouse and the VAT rate in force.
-  // A keyboard-only run never needs to click, so the shift is opened for the till automatically.
+  // Load the terminal context: the open shift, the branch's warehouse, the VAT rate, the printer.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const contextRes = await apiFetch(`/api/pos/shifts?till_id=${encodeURIComponent(tillId)}`);
-      if (!contextRes.ok) return;
-      const context = (await contextRes.json()) as {
-        shift_id: string | null;
-        warehouse_id: string | null;
-        tax_code: string;
-        tax_rate: string;
-      };
-      if (cancelled) return;
-      setWarehouseId(context.warehouse_id);
-      setTaxCode(context.tax_code);
-      setTaxRate(new Decimal(context.tax_rate));
-      if (context.shift_id) {
-        setShiftId(context.shift_id);
-        return;
+      if (contextRes.ok) {
+        const context = (await contextRes.json()) as {
+          shift_id: string | null;
+          warehouse_id: string | null;
+          tax_code: string;
+          tax_rate: string;
+        };
+        if (!cancelled) {
+          setWarehouseId(context.warehouse_id);
+          setTaxCode(context.tax_code);
+          setTaxRate(new Decimal(context.tax_rate));
+          if (context.shift_id) setShiftId(context.shift_id);
+          else {
+            const openRes = await apiFetch('/api/pos/shifts', {
+              method: 'POST',
+              body: JSON.stringify({ till_id: tillId, opening_float: '0' }),
+            });
+            if (openRes.ok) {
+              const opened = (await openRes.json()) as { shift_id: string };
+              if (!cancelled) setShiftId(opened.shift_id);
+            }
+          }
+        }
       }
-      const openRes = await apiFetch('/api/pos/shifts', {
-        method: 'POST',
-        body: JSON.stringify({ till_id: tillId, opening_float: '0' }),
-      });
-      if (openRes.ok) {
-        const opened = (await openRes.json()) as { shift_id: string };
-        if (!cancelled) setShiftId(opened.shift_id);
+
+      try {
+        const settings = await apiJson<PrinterSettings>('/api/pos/printer');
+        if (!cancelled) setPrinter(settings);
+      } catch {
+        /* keep the browser default */
       }
     })();
     return () => {
@@ -125,9 +158,7 @@ export default function PosPage() {
     setZwgRate(ZWG_SEED_RATE);
   }, [setZwgRate]);
 
-  // The offline outbox sync loop. On load, count what survived the reload; then keep trying to
-  // drain it. Only one request is ever in flight (syncOnce guards it), and an entry is removed
-  // only when the server reports it committed or duplicate.
+  // The offline outbox drain loop.
   const drain = useCallback(async () => {
     setSyncing(true);
     try {
@@ -146,7 +177,6 @@ export default function PosPage() {
     const onOnline = () => void drain();
     window.addEventListener('online', onOnline);
     const timer = setInterval(() => void drain(), 15_000);
-    // Try immediately as well, so a backlog left by a previous session drains on load.
     void drain();
     return () => {
       window.removeEventListener('online', onOnline);
@@ -154,8 +184,7 @@ export default function PosPage() {
     };
   }, [drain]);
 
-  // The scanner behaves as a keyboard: it types the barcode and sends Enter. Keep focus on the
-  // scan field so no mouse is ever needed.
+  // A scanner types the barcode and sends Enter. Keep focus on the scan field by default.
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
@@ -185,8 +214,6 @@ export default function PosPage() {
 
   const addHit = useCallback(
     async (hit: SearchHit) => {
-      // Resolve the price the same way the sale will, so the till's total (and therefore F9 exact
-      // cash) matches the invoice to the cent. The scan itself is still one operator action.
       let unitPrice = new Decimal(0);
       try {
         const response = await apiFetch('/api/pos/price', {
@@ -201,7 +228,7 @@ export default function PosPage() {
           if (priced) unitPrice = new Decimal(priced.unit_price);
         }
       } catch {
-        /* fall through with a zero price; the sale will still price server-side */
+        /* fall through with a zero price; the sale prices server-side */
       }
 
       const lineSubtotal = unitPrice.toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
@@ -223,10 +250,6 @@ export default function PosPage() {
     [addLine, taxRate],
   );
 
-  /**
-   * A scanner types the barcode and presses Enter in well under the debounce window, so Enter
-   * resolves the code immediately rather than waiting for the live lookup. One scan is one action.
-   */
   const scanNow = useCallback(
     async (code: string) => {
       const response = await apiFetch(`/api/pos/search?q=${encodeURIComponent(code)}`);
@@ -238,15 +261,12 @@ export default function PosPage() {
     [addHit],
   );
 
-  const postSale = useCallback(async () => {
-    if (lines.length === 0 || tenders.length === 0) return;
+  const postSale = useCallback(async (): Promise<PosReceipt | null> => {
+    if (lines.length === 0 || tenders.length === 0) return null;
     setStatus('posting');
     setError(null);
 
-    // The id is generated once, here, at sale time. It is the server's idempotency key, so a
-    // retry — live, queued or synced — can never ring the sale twice.
     const clientSaleId = crypto.randomUUID();
-
     const saleBody = {
       warehouse_id: warehouseId,
       shift_id: shiftId,
@@ -265,7 +285,6 @@ export default function PosPage() {
       })),
     };
 
-    /** The outbox entry, in the exact shape the sync endpoint accepts. */
     const queuedSale: Omit<OutboxSale, 'attempts' | 'nextAttemptAt' | 'lastError'> = {
       clientSaleId,
       shiftId,
@@ -293,166 +312,99 @@ export default function PosPage() {
         body: JSON.stringify(saleBody),
       });
     } catch {
-      // The network is down. The sale is already complete from the customer's point of view, so
-      // it goes to the outbox rather than being lost. This is the offline path.
       await enqueueSale(queuedSale);
       setPending(await countPending());
       setStatus('queued');
-      return;
+      return null;
     }
 
     if (!response.ok) {
-      // 429 (rate limited) and 5xx are transient: queue and let the sync loop retry. A 4xx like
-      // "insufficient stock" is a real refusal the cashier must see, so it is surfaced.
       if (response.status === 429 || response.status >= 500) {
         await enqueueSale(queuedSale);
         setPending(await countPending());
         setStatus('queued');
-        return;
+        return null;
       }
       const payload = (await response.json().catch(() => ({}))) as { error?: string };
       setStatus('error');
       setError(payload.error ?? `sale failed (${response.status})`);
-      return;
+      return null;
     }
 
+    const payload = (await response.json()) as RawSaleResponse;
+    return toReceipt(payload);
+  }, [lines, tenders, warehouseId, shiftId, taxCode, setStatus, setError]);
+
+  /**
+   * The whole checkout: ring the sale, build the receipt, print. The sale commits before the print
+   * is issued, and the two timings are shown on screen (the print-issued delay and the total).
+   */
+  const checkout = useCallback(async () => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setError(null);
+    setTimings(null);
     try {
-      const payload = (await response.json()) as {
-        sale_id: string;
-        invoice_no: string;
-        currency: string;
-        subtotal: string;
-        tax_total: string;
-        total: string;
-        change_total: string;
-        lines: Array<{
-          line_no: number;
-          description: string | null;
-          qty: string;
-          unit_price: string;
-          line_subtotal: string;
-          line_tax: string;
-          line_total: string;
-          tax_rate: string;
-        }>;
-        payments: Array<{
-          method: string;
-          currency: string;
-          amount_tendered: string;
-          amount_applied: string;
-          rate: string;
-          base_amount: string;
-          change_given: string;
-        }>;
-        fiscal?: {
-          status: string;
-          signature?: string | null;
-          qr_code?: string | null;
-          receipt_no?: string | null;
-          sent_at?: string | null;
-          message?: string | null;
-        } | null;
-      };
-
-      const nextReceipt: PosReceipt = {
-        saleId: payload.sale_id,
-        invoiceNo: payload.invoice_no,
-        currency: payload.currency,
-        subtotal: new Decimal(payload.subtotal),
-        taxTotal: new Decimal(payload.tax_total),
-        total: new Decimal(payload.total),
-        changeTotal: new Decimal(payload.change_total),
-        lines: payload.lines.map((line) => ({
-          lineNo: line.line_no,
-          description: line.description,
-          qty: new Decimal(line.qty),
-          unitPrice: new Decimal(line.unit_price),
-          lineSubtotal: new Decimal(line.line_subtotal),
-          lineTax: new Decimal(line.line_tax),
-          lineTotal: new Decimal(line.line_total),
-          taxRate: new Decimal(line.tax_rate),
-        })),
-        payments: payload.payments.map((payment) => ({
-          method: payment.method,
-          currency: payment.currency,
-          amountTendered: new Decimal(payment.amount_tendered),
-          amountApplied: new Decimal(payment.amount_applied),
-          rate: new Decimal(payment.rate),
-          baseAmount: new Decimal(payment.base_amount),
-          changeGiven: new Decimal(payment.change_given),
-        })),
-        fiscal: {
-          status:
-            payload.fiscal?.status === 'sent'
-              ? 'sent'
-              : payload.fiscal?.status === 'pending'
-                ? 'pending'
-                : 'none',
-          signature: payload.fiscal?.signature ?? null,
-          qrCode: payload.fiscal?.qr_code ?? null,
-          receiptNo: payload.fiscal?.receipt_no ?? null,
-          sentAt: payload.fiscal?.sent_at ?? null,
-          message: payload.fiscal?.message ?? null,
+      // `postSale` sets the status (paid / queued / error) and returns null when the sale did not
+      // commit; in that case there is nothing to print.
+      const result = await checkoutAndPrint({
+        postSale: async () => {
+          const sale = await postSale();
+          if (!sale) throw new CheckoutAborted();
+          return sale;
         },
-      };
-
-      setReceipt(nextReceipt);
+        settings: printer,
+        cashier: tillId,
+        zwgRate,
+        now: () => Date.now(),
+      });
+      setTimings(result.timings);
+      setReceipt(result.receipt);
       setStatus('paid');
     } catch (caught) {
+      if (caught instanceof CheckoutAborted) return;
       setStatus('error');
       setError((caught as Error).message);
+    } finally {
+      busyRef.current = false;
     }
-  }, [lines, tenders, warehouseId, shiftId, taxCode, setStatus, setError, setReceipt]);
+  }, [postSale, printer, tillId, zwgRate, setReceipt, setStatus, setError]);
 
+  const payExact = useCallback(
+    (currency: 'USD' | 'ZWG') => {
+      if (remaining.greaterThan(0)) {
+        addTender({ method: 'cash', currency, amountTendered: exactCash(currency) });
+      }
+      setPayOpen(true);
+    },
+    [remaining, addTender, exactCash],
+  );
+
+  /**
+   * The scan field's own keys. Function keys (F2/F3/F4/F9/F10) are handled at the document level so
+   * they work no matter what has focus; handling them here too would count each press twice.
+   */
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLInputElement>) => {
-      // One action per operator key. This counter is the observable proof of the 3-action flow.
-      if (event.key === 'F9') {
-        event.preventDefault();
-        bumpActions();
-        if (remaining.greaterThan(0)) {
-          addTender({ method: 'cash', currency: 'USD', amountTendered: exactCash('USD') });
-        }
-        return;
-      }
-
-      if (event.key === 'F10') {
-        event.preventDefault();
-        bumpActions();
-        if (remaining.greaterThan(0)) {
-          addTender({ method: 'cash', currency: 'ZWG', amountTendered: exactCash('ZWG') });
-        }
-        return;
-      }
-
       if (event.key === 'Enter') {
         event.preventDefault();
         bumpActions();
-
-        // A scan in the field is the first action: the barcode plus Enter adds the item. The code
-        // is resolved immediately, because a scanner sends Enter long before the debounce fires.
         if (scan.trim() !== '') {
-          const hit = hits.length > 0 ? hits[Math.min(selected, hits.length - 1)] : null;
-          if (hit && hits.some((candidate) => candidate.barcode === scan.trim())) {
-            void addHit(hit);
-          } else {
-            void scanNow(scan.trim());
-          }
+          const trimmed = scan.trim();
+          const exact = hits.find((hit) => hit.barcode === trimmed);
+          if (exact) void addHit(exact);
+          else void scanNow(trimmed);
           return;
         }
-
         if (status === 'paid' || status === 'queued' || status === 'error') {
           clear();
+          setPayOpen(false);
+          setTimings(null);
           return;
         }
-
-        // Nothing left to tender: confirm and print.
-        if (remaining.isZero() && tenders.length > 0) {
-          void postSale();
-        }
+        if (remaining.isZero() && tenders.length > 0) void checkout();
         return;
       }
-
       if (event.key === 'ArrowDown' && hits.length > 0) {
         event.preventDefault();
         setSelected((current) => Math.min(current + 1, hits.length - 1));
@@ -465,19 +417,131 @@ export default function PosPage() {
     [
       scan,
       hits,
-      selected,
       remaining,
       tenders.length,
       status,
       addHit,
       scanNow,
-      addTender,
       bumpActions,
       clear,
-      exactCash,
-      postSale,
+      checkout,
     ],
   );
+
+  // The document-level scanner and shortcut handler: a scan works no matter what has focus, and the
+  // shortcuts work from anywhere on the till. Keys typed into the scan field are handled by the
+  // field's own onKeyDown above, so this ignores them to avoid double counting.
+  useEffect(() => {
+    const isScanField = (target: EventTarget | null): boolean =>
+      target instanceof HTMLElement && target.dataset.testid === 'scan';
+
+    const onDocumentKeyDown = (event: KeyboardEvent) => {
+      const inField = isScanField(event.target);
+      const shortcut = resolveShortcut(event.key);
+      if (shortcut === 'scan') {
+        event.preventDefault();
+        bumpActions();
+        scannerRef.current.reset();
+        setScan('');
+        inputRef.current?.focus();
+        return;
+      }
+      if (shortcut === 'hold') {
+        event.preventDefault();
+        bumpActions();
+        scannerRef.current.reset();
+        setScan('');
+        hold();
+        return;
+      }
+      if (shortcut === 'recall') {
+        event.preventDefault();
+        bumpActions();
+        recall();
+        return;
+      }
+      if (shortcut === 'pay') {
+        event.preventDefault();
+        bumpActions();
+        payExact('USD');
+        return;
+      }
+      if (shortcut === 'pay-zwg') {
+        event.preventDefault();
+        bumpActions();
+        payExact('ZWG');
+        return;
+      }
+      if (inField) return;
+
+      const decision = scannerRef.current.feed({ key: event.key, timeStamp: event.timeStamp });
+      if (decision.kind === 'char') {
+        event.preventDefault();
+        setScan((current) => current + decision.value);
+        return;
+      }
+      if (decision.kind === 'scan') {
+        event.preventDefault();
+        bumpActions();
+        setScan('');
+        void scanNow(decision.code);
+        return;
+      }
+      if (decision.kind === 'enter' && event.key === 'Enter') {
+        event.preventDefault();
+        bumpActions();
+        if (status === 'paid' || status === 'queued' || status === 'error') {
+          clear();
+          setPayOpen(false);
+          setTimings(null);
+          return;
+        }
+        if (remaining.isZero() && tenders.length > 0) void checkout();
+      }
+    };
+
+    document.addEventListener('keydown', onDocumentKeyDown);
+    return () => document.removeEventListener('keydown', onDocumentKeyDown);
+  }, [
+    bumpActions,
+    hold,
+    recall,
+    scanNow,
+    status,
+    clear,
+    remaining,
+    tenders.length,
+    checkout,
+    payExact,
+  ]);
+
+  const toggleCamera = useCallback(async () => {
+    if (cameraOn) {
+      cameraRef.current?.stop();
+      cameraRef.current = null;
+      setCameraOn(false);
+      return;
+    }
+    setCameraError(null);
+    try {
+      const video = videoRef.current;
+      if (!video) return;
+      const scanner = await startCameraScan({
+        video,
+        onResult: (code) => {
+          bumpActions();
+          void scanNow(code);
+        },
+        onError: (error) => setCameraError(error.message),
+      });
+      cameraRef.current = scanner;
+      setCameraOn(true);
+    } catch (caught) {
+      setCameraError((caught as Error).message);
+    }
+  }, [cameraOn, bumpActions, scanNow]);
+
+  useEffect(() => () => cameraRef.current?.stop(), []);
 
   return (
     <main className="pos" onMouseDown={(event) => event.preventDefault()}>
@@ -487,8 +551,8 @@ export default function PosPage() {
       <section className="left">
         <h1>POS</h1>
         <CloudBadge health={health} />
-        <p className="hint">
-          Scan (barcode + Enter) · F9 exact cash · F10 exact ZWG cash · Enter confirm &amp; print
+        <p className="hint" data-testid="shortcut-hint">
+          {shortcutHint()} · Enter confirm &amp; print
         </p>
 
         <label className="scan-label">
@@ -504,6 +568,16 @@ export default function PosPage() {
             onKeyDown={onKeyDown}
           />
         </label>
+
+        {cameraSupported() && (
+          <div className="camera">
+            <button type="button" data-testid="camera-toggle" onClick={() => void toggleCamera()}>
+              {cameraOn ? 'Stop camera' : 'Scan with camera'}
+            </button>
+            <video ref={videoRef} data-testid="camera-video" muted playsInline style={{ width: 200 }} />
+            {cameraError && <span className="error">{cameraError}</span>}
+          </div>
+        )}
 
         {hits.length > 0 && (
           <ul className="hits" data-testid="hits">
@@ -558,26 +632,137 @@ export default function PosPage() {
           ))}
         </div>
 
+        {payOpen && (
+          <div className="pay" data-testid="pay-panel">
+            <strong>Payment</strong>
+            <span data-testid="pay-amount">
+              {displayMoney(remaining)} {remaining.isZero() ? 'settled' : 'due'}
+            </span>
+            <span className="hint">Enter confirms and prints</span>
+          </div>
+        )}
+
         <div className="status">
           <span data-testid="actions">Actions {actions}</span>
           <span data-testid="status">{status}</span>
           <span data-testid="pending">Pending {pending}</span>
+          <span data-testid="held">Held {held.length}</span>
           {syncing && <span data-testid="syncing">syncing</span>}
+          {timings && (
+            <span data-testid="print-timing">
+              print {timings.printIssuedMs}ms · total {timings.totalMs}ms
+            </span>
+          )}
           {error && <span className="error">{error}</span>}
         </div>
       </section>
 
       <section className="right" data-testid="receipt">
-        {receipt ? <Receipt receipt={receipt} /> : <p className="hint">No receipt yet.</p>}
+        {receipt ? (
+          <Receipt58mm
+            data={buildReceiptData(receipt, {
+              shop: defaultShop(),
+              cashier: tillId,
+              zwgRate,
+              date: new Date(),
+            })}
+          />
+        ) : (
+          <p className="hint">No receipt yet.</p>
+        )}
       </section>
     </main>
   );
 }
 
+/** Thrown when the sale did not commit, so the checkout has nothing to print. */
+class CheckoutAborted extends Error {}
+
+interface RawSaleResponse {
+  sale_id: string;
+  invoice_id: string;
+  invoice_no: string;
+  currency: string;
+  subtotal: string;
+  tax_total: string;
+  total: string;
+  change_total: string;
+  lines: Array<{
+    line_no: number;
+    description: string | null;
+    qty: string;
+    unit_price: string;
+    line_subtotal: string;
+    line_tax: string;
+    line_total: string;
+    tax_rate: string;
+  }>;
+  payments: Array<{
+    method: string;
+    currency: string;
+    amount_tendered: string;
+    amount_applied: string;
+    rate: string;
+    base_amount: string;
+    change_given: string;
+  }>;
+  fiscal?: {
+    status: string;
+    signature?: string | null;
+    qr_code?: string | null;
+    receipt_no?: string | null;
+    sent_at?: string | null;
+    message?: string | null;
+  } | null;
+}
+
+function toReceipt(payload: RawSaleResponse): PosReceipt {
+  return {
+    saleId: payload.sale_id,
+    invoiceNo: payload.invoice_no,
+    currency: payload.currency,
+    subtotal: new Decimal(payload.subtotal),
+    taxTotal: new Decimal(payload.tax_total),
+    total: new Decimal(payload.total),
+    changeTotal: new Decimal(payload.change_total),
+    lines: payload.lines.map((line) => ({
+      lineNo: line.line_no,
+      description: line.description,
+      qty: new Decimal(line.qty),
+      unitPrice: new Decimal(line.unit_price),
+      lineSubtotal: new Decimal(line.line_subtotal),
+      lineTax: new Decimal(line.line_tax),
+      lineTotal: new Decimal(line.line_total),
+      taxRate: new Decimal(line.tax_rate),
+    })),
+    payments: payload.payments.map((payment) => ({
+      method: payment.method,
+      currency: payment.currency,
+      amountTendered: new Decimal(payment.amount_tendered),
+      amountApplied: new Decimal(payment.amount_applied),
+      rate: new Decimal(payment.rate),
+      baseAmount: new Decimal(payment.base_amount),
+      changeGiven: new Decimal(payment.change_given),
+    })),
+    fiscal: {
+      status:
+        payload.fiscal?.status === 'sent'
+          ? 'sent'
+          : payload.fiscal?.status === 'pending'
+            ? 'pending'
+            : 'none',
+      signature: payload.fiscal?.signature ?? null,
+      qrCode: payload.fiscal?.qr_code ?? null,
+      receiptNo: payload.fiscal?.receipt_no ?? null,
+      sentAt: payload.fiscal?.sent_at ?? null,
+      message: payload.fiscal?.message ?? null,
+    },
+  };
+}
+
 /**
  * The branch/cloud status badge. Shown always, because a cashier must know whether the cloud is
- * reachable before they need it. `incompatible` is a warning, not an outage: the branch still sells,
- * but it will not push until the versions match.
+ * reachable before they need it.
  */
 function CloudBadge({ health }: { health: BranchHealthState }) {
   if (!health.branchReachable) {
@@ -612,84 +797,6 @@ function CloudBadge({ health }: { health: BranchHealthState }) {
   );
 }
 
-function Receipt({ receipt }: { receipt: PosReceipt }) {
-  const taxByRate = new Map<string, Decimal>();
-  for (const line of receipt.lines) {
-    const key = line.taxRate.toFixed(4);
-    taxByRate.set(key, (taxByRate.get(key) ?? new Decimal(0)).plus(line.lineTax));
-  }
-
-  return (
-    <article className="receipt">
-      <header>
-        <h2>ERP Core</h2>
-        <p>Tax invoice {receipt.invoiceNo}</p>
-      </header>
-
-      <table>
-        <tbody>
-          {receipt.lines.map((line) => (
-            <tr key={line.lineNo}>
-              <td>
-                {line.description ?? 'Item'} {line.qty.toString()} × {displayMoney(line.unitPrice)}
-              </td>
-              <td className="right">{displayMoney(line.lineTotal)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-
-      <dl>
-        <div>
-          <dt>Subtotal</dt>
-          <dd>{displayMoney(receipt.subtotal)}</dd>
-        </div>
-        {[...taxByRate.entries()].map(([rate, tax]) => (
-          <div key={rate}>
-            <dt>VAT {(Number(rate) * 100).toFixed(0)}%</dt>
-            <dd>{displayMoney(tax)}</dd>
-          </div>
-        ))}
-        <div>
-          <dt>Total</dt>
-          <dd data-testid="receipt-total">{displayMoney(receipt.total)}</dd>
-        </div>
-      </dl>
-
-      <section className="payments">
-        {receipt.payments.map((payment, index) => (
-          <p key={index}>
-            {payment.currency} {payment.method} {displayMoney(payment.amountTendered)}
-            {payment.changeGiven.greaterThan(0) && <> · change {displayMoney(payment.changeGiven)}</>}
-          </p>
-        ))}
-      </section>
-
-      {receipt.fiscal.status === 'sent' ? (
-        <section className="fiscal" data-testid="receipt-fiscal">
-          {receipt.fiscal.receiptNo && <p>Fiscal {receipt.fiscal.receiptNo}</p>}
-          {receipt.fiscal.signature && (
-            <p data-testid="fiscal-signature">Signature {receipt.fiscal.signature}</p>
-          )}
-          {receipt.fiscal.qrCode && (
-            <p data-testid="fiscal-qr" className="qr">
-              QR {receipt.fiscal.qrCode}
-            </p>
-          )}
-        </section>
-      ) : (
-        <section className="fiscal" data-testid="receipt-fiscal">
-          <p data-testid="fiscal-pending">Fiscal pending</p>
-        </section>
-      )}
-
-      <footer>
-        <p>Thank you</p>
-      </footer>
-    </article>
-  );
-}
-
 /** 58mm thermal receipt. @page sets the paper width; the article is sized to match. */
 const POS_STYLES = `
   @page { width: 58mm; margin: 0; }
@@ -701,6 +808,7 @@ const POS_STYLES = `
   .hint { color: #555; font-size: 12px; margin: 0 0 10px; }
   .scan-label { display: block; font-size: 12px; color: #555; }
   .scan { width: 100%; font-size: 18px; padding: 8px; }
+  .camera { margin: 8px 0; display: flex; gap: 8px; align-items: center; }
   .hits { list-style: none; margin: 6px 0; padding: 0; border: 1px solid #ddd; }
   .hit { padding: 6px 8px; font-size: 14px; }
   .hit.selected { background: #eef; }
@@ -710,7 +818,10 @@ const POS_STYLES = `
   .totals { display: flex; gap: 16px; font-size: 14px; align-items: baseline; }
   .totals strong { font-size: 18px; }
   .tenders { margin-top: 8px; font-size: 14px; }
-  .status { margin-top: 10px; display: flex; gap: 16px; font-size: 13px; color: #444; }
+  .pay { margin-top: 8px; padding: 8px; border: 1px solid #333; display: flex; gap: 16px;
+         align-items: baseline; font-size: 14px; }
+  .status { margin-top: 10px; display: flex; gap: 16px; font-size: 13px; color: #444;
+            flex-wrap: wrap; }
   .error { color: #b00; }
   .badge { display: inline-block; margin: 0 0 8px; padding: 2px 8px; border-radius: 10px;
            font-size: 12px; font-weight: 600; }
@@ -719,17 +830,6 @@ const POS_STYLES = `
   .badge-warn { background: #fff4e5; color: #b26a00; }
   .badge-down { background: #eee; color: #555; }
   .right { border-left: 1px dashed #bbb; padding-left: 12px; }
-  .receipt { width: 58mm; font-size: 12px; }
-  .receipt header, .receipt footer { text-align: center; }
-  .receipt h2 { font-size: 14px; margin: 0; }
-  .receipt table { width: 100%; border-collapse: collapse; }
-  .receipt td { padding: 1px 0; vertical-align: top; }
-  .receipt .right { text-align: right; }
-  .receipt dl { margin: 6px 0; }
-  .receipt dl div { display: flex; justify-content: space-between; }
-  .receipt dt, .receipt dd { margin: 0; }
-  .receipt .payments { border-top: 1px dashed #999; padding-top: 4px; }
-  .receipt .payments p { margin: 2px 0; }
   @media print {
     .left { display: none; }
     .right { border: 0; padding: 0; }

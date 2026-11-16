@@ -77,6 +77,8 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'fiscal_invoices', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'fiscal_invoice_attempts', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'number_blocks', scope: 'branch', highVolume: true, partitioned: false },
+  // H4 (hardware and receipts): the branch's printer configuration.
+  { name: 'printer_settings', scope: 'branch', highVolume: true, partitioned: false },
   // H1 (branch server): device registration, local PIN auth, sync state.
   { name: 'device_registrations', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'cashier_pins', scope: 'branch', highVolume: true, partitioned: false },

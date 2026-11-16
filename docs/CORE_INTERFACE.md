@@ -290,3 +290,34 @@ the same migrations and the same posting functions as the cloud. The fiscal enqu
   `POST /api/fiscal/invoices/:id/send`, `GET/POST /api/fiscal/numbers`,
   `POST /api/branch/numbers/claim` (cloud). Page `/settings/fiscal`.
 * Loop: `npm run branch:fiscal` (`scripts/branch-fiscal-loop.ts`).
+
+## H4 extension (Hardware and receipts)
+
+Additive, recorded in ADR-0039 to ADR-0041. It adds no core-table change and no core-function change;
+it reads the CORE invoice/receipt data a POS sale already produced and turns it into a printed slip.
+The relay is branch-only and outbound-only (decision 16); nothing here blocks a sale.
+
+* New branch-scoped table: `printer_settings` (one row per `(org_id, branch_id, label)`; `mode`
+  `browser` | `network`; `host`/`port` meaningful in network mode; a network row must carry a host).
+* `app.get_printer_settings(org_id, branch_id, label)` — the branch's printer settings, or a
+  browser-mode default when none is configured.
+* `app.set_printer_settings(org_id, branch_id, mode, host, port, label)` — upsert, idempotent on
+  `(org_id, branch_id, label)`; clears the host in browser mode.
+* TypeScript:
+  * `src/verticals/pos/receiptData.ts` (`ReceiptData`, `ReceiptShop`, `buildReceiptData`,
+    `vatBands`, `defaultShop`) — the one receipt model both the screen slip and the printer consume.
+  * `src/verticals/pos/escpos.ts` (`generateEscPos`, `escPosToBase64`, `escPosFromBase64`,
+    `receiptLines`, `qrMatrix`, `RECEIPT_COLUMNS`) — pure ESC/POS bytes, with a native QR command when
+    the fiscal block carries a QR payload.
+  * `src/verticals/pos/printing.ts` (`PrinterSettings`, `PrinterTransport`, `printerTransport`,
+    `printReceipt`, `loadPrinterSettings`, `savePrinterSettings`, `defaultPrinterSettings`,
+    `sampleReceiptData`).
+  * `src/verticals/pos/checkout.ts` (`checkoutAndPrint`) — ring the sale, then print; records the
+    timing from commit to print issued.
+  * `src/verticals/pos/scanner.ts` (`ScannerBuffer`), `src/verticals/pos/camera.ts`,
+    `src/verticals/pos/shortcuts.ts` (`POS_SHORTCUTS`, `resolveShortcut`, `shortcutHint`).
+  * `src/verticals/pos/Receipt58mm.tsx` — the 58mm on-screen slip.
+  * `src/branch/printer.ts` (`relayEscPos`, `relayEscPosBase64`, `decodeEscPosBase64`).
+* Endpoints: `GET/PUT /api/pos/printer`, `POST /api/pos/printer/test`, `POST /api/branch/print`
+  (branch-only; writes the decoded bytes to the printer socket).
+* Pages: `/pos` (till, with the receipt and timings), `/pos/settings` (printer and scanner settings).

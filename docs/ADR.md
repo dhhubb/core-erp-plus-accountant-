@@ -837,3 +837,63 @@ fixed numbers, so the new tests continue from the highest number present (ADR-00
 | Two workers never submit the same invoice twice | 68 | Concurrent passes with SKIP LOCKED submit each invoice once |
 
 **Consequence.** No number is reused and no test is dropped. The prior 63 tests are untouched.
+
+## ADR-0039 — Printer settings live in the database; the relay is branch-side and outbound-only
+
+**Context.** H4 must print a 58mm ESC/POS receipt. A branch may have a network thermal printer on the
+shop LAN (`host:port`, usually 9100), or may print through the browser dialog. The destination must be
+the same for every till in the branch, survive a re-imaged till, and never require the cloud to reach
+into a shop LAN. Decision 16 is that the branch opens the socket, outbound only.
+
+**Decision.** The configuration lives in `public.printer_settings` (org + branch, one active row per
+`label`), read and written through `app.get_printer_settings` / `app.set_printer_settings`. `mode` is
+`browser` or `network`; a `network` row must carry a host (a table check enforces it, and the setter
+clears the host in browser mode). The **relay itself is not in SQL**: the till generates the ESC/POS
+bytes, sends them to the branch (`POST /api/branch/print`) as base64 inside JSON — a transport
+encoding, nothing more — and the branch decodes them and writes the raw bytes to the socket. Only the
+branch relays; the route refuses on the cloud with 409. The byte generator (`generateEscPos`) is pure,
+so the same receipt always yields the same bytes and the screen slip and the printed slip come from
+one `ReceiptData`.
+
+**Consequence.** A branch can print with no configuration at all (browser mode is the default). The
+cloud never needs to reach a shop LAN, and a network printer is reachable from any till in the branch
+because the destination is branch state, not till state. The relay opens a real TCP socket, so the
+H4 tests drive it against a real listening server rather than a mock.
+
+## ADR-0040 — The till reads scans at the document level; the shortcut map is one pure table
+
+**Context.** A keyboard-wedge barcode scanner is a keyboard. If the till only listens on a focused
+input, a cashier who clicks elsewhere, or a scanner that does not focus the field, silently loses a
+scan. The R3 keyboard test also relies on function keys.
+
+**Decision.** `ScannerBuffer` (`src/verticals/pos/scanner.ts`) is a pure, testable state machine that
+turns a fast keystroke burst ending in Enter into a scan, and a slow burst into a hand-typed code
+with the same downstream path. The till attaches one document-level key listener, so a scan works no
+matter what has focus. Function keys are resolved through one pure table
+(`src/verticals/pos/shortcuts.ts`): F2 focus scan, F3 hold, F4 recall, F9 pay (exact, preselected),
+F10 pay in ZWG. The scan field's own handler does not handle the function keys, so a keypress is
+never counted twice. The camera scanner is offered only over HTTPS, because a plain-HTTP LAN cannot
+grant camera access; the affordance is hidden rather than shown and failing.
+
+**Consequence.** The scanner works with no setup and with no focus requirement, the shortcut mapping
+cannot drift from the keys, and the buffer is asserted in unit tests without a browser. F9 changed
+from "tender exact cash immediately" to "open payment with the exact amount preselected", so a
+cashier can still adjust before Enter; the R3 keyboard test (three actions) is unaffected.
+
+## ADR-0041 — H4 owns tests 69–74; the print timing is measured from commit to print issued
+
+**Context.** H1 owns 49–52, H2 owns 53–63 (ADR-0033), H3 owns 64–68 (ADR-0038). The H4 brief
+describes behaviours rather than fixed numbers, so the new tests continue from the highest number
+present (ADR-0010, ADR-0026). H4 must also show the printed receipt is issued promptly after the
+sale.
+
+**Decision.** H4 owns **69–74** in `tests/hardware-h4.test.ts` (the printer settings: default, round
+trip, validation, tenant isolation, table invariants, functions). The relay, the pure receipt/ESC-POS
+logic, the scanner, the shortcuts and the print timing are covered by `tests/hardware-h4-printer.test.ts`,
+`tests/hardware-h4-units.test.ts` and `tests/hardware-h4-api.test.ts` without claiming numbers, so no
+number is reused. The print timing is measured **from the commit of the sale to the moment the print
+is issued** (before the transport runs), so it measures the till's own delay, not the printer's
+speed, and must be under 1 second.
+
+**Consequence.** No number is reused and no prior test is touched. The timing is observable on the
+till and asserted in a unit test with an injected clock, so it is not flaky.

@@ -72,9 +72,19 @@ export interface PosReceipt {
 
 export type PosStatus = 'idle' | 'posting' | 'paid' | 'queued' | 'error';
 
+/** A parked cart: the lines and tenders set aside by F3, recalled later. */
+export interface HeldCart {
+  id: string;
+  lines: CartLine[];
+  tenders: CartTender[];
+  total: Decimal;
+}
+
 interface CartState {
   lines: CartLine[];
   tenders: CartTender[];
+  /** Parked carts (F3 hold), most recent first. */
+  held: HeldCart[];
   /** Operator key actions taken since the cart was last cleared. A one-item exact-cash sale is 3. */
   actions: number;
   status: PosStatus;
@@ -90,6 +100,10 @@ interface CartState {
   setStatus: (status: PosStatus) => void;
   setError: (message: string | null) => void;
   setReceipt: (receipt: PosReceipt | null) => void;
+  /** F3: park the current cart and start a fresh one. */
+  hold: () => void;
+  /** Recall the most recently parked cart. */
+  recall: () => void;
   clear: () => void;
 }
 
@@ -100,6 +114,7 @@ function lineKey(variantId: string, unitPrice: Decimal): string {
 export const useCart = create<CartState>((set) => ({
   lines: [],
   tenders: [],
+  held: [],
   actions: 0,
   status: 'idle',
   error: null,
@@ -132,6 +147,53 @@ export const useCart = create<CartState>((set) => ({
   setError: (message) => set({ error: message }),
 
   setReceipt: (receipt) => set({ receipt }),
+
+  // F3 hold: park the current cart (keeping its total for the recall list) and clear the till for
+  // the next customer. An empty cart is not worth parking.
+  hold: () =>
+    set((state) => {
+      if (state.lines.length === 0) return state;
+      const total = cartTotals(state.lines).total;
+      const held: HeldCart = {
+        id: `${Date.now()}-${state.held.length}`,
+        lines: state.lines,
+        tenders: state.tenders,
+        total,
+      };
+      return {
+        lines: [],
+        tenders: [],
+        held: [held, ...state.held].slice(0, 20),
+        status: 'idle',
+        error: null,
+        receipt: null,
+      };
+    }),
+
+  // Recall the most recently parked cart, restoring its lines and tenders. Any cart already on the
+  // till is parked first, so a recall never discards work.
+  recall: () =>
+    set((state) => {
+      const [next, ...rest] = state.held;
+      if (!next) return state;
+      const held = [...rest];
+      if (state.lines.length > 0) {
+        held.unshift({
+          id: `${Date.now()}-recall`,
+          lines: state.lines,
+          tenders: state.tenders,
+          total: cartTotals(state.lines).total,
+        });
+      }
+      return {
+        lines: next.lines,
+        tenders: next.tenders,
+        held,
+        status: 'idle',
+        error: null,
+        receipt: null,
+      };
+    }),
 
   clear: () => set({ lines: [], tenders: [], actions: 0, status: 'idle', error: null, receipt: null }),
 }));

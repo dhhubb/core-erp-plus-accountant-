@@ -777,6 +777,50 @@ failed rows and a manual submit for pending or failed rows
 All carry `org_id`, `created_at`, forced RLS and the standard indexes, and are registered in
 `scripts/check-tenant-tables.sql`.
 
+## Hardware and receipts (H4)
+
+H4 makes the till usable at the counter: a scanner that works without focus, three shortcuts, and a
+receipt that prints within a second of the sale. See ADR-0039 to ADR-0041.
+
+**Keyboard-wedge scanner.** A scanner is a keyboard: it types the barcode and sends Enter. The till
+reads keystrokes at the document level (`ScannerBuffer` in `src/verticals/pos/scanner.ts`), so a scan
+works no matter what has focus. The same buffer serves a hand-typed barcode plus Enter, so there is
+one code path for both. A camera scanner is offered only over HTTPS (a plain-HTTP LAN cannot grant
+camera access, so the affordance is hidden rather than shown and failing).
+
+**Shortcuts.** F2 focuses the scan field, F3 holds the cart, F4 recalls it, F9 opens payment with the
+exact amount preselected (Enter confirms), F10 pays in ZWG. The mapping is one pure table
+(`src/verticals/pos/shortcuts.ts`), so the keys and the actions cannot drift apart.
+
+**Receipt.** `Receipt58mm` renders the 58mm slip on screen from the same `ReceiptData` that
+`generateEscPos(receiptData)` turns into ESC/POS bytes, so the screen slip and the printed slip can
+never disagree. It shows the shop header (logo, name, address, VAT number), the receipt and invoice
+numbers, date and cashier, the lines, the VAT breakdown exclusive and inclusive at each rate, the
+totals in USD and ZWG, the fiscal QR when the device returned one, and the footer.
+
+**Printing.** The sale commits first; only then is the print issued. The checkout records two
+timings — the delay from commit to print issued (must be under 1s) and the total — and shows them on
+the till. Two transports, per branch, stored in `printer_settings`:
+
+* **browser** — `window.print()` with `@page { width: 58mm }`. Works with no configuration.
+* **network** — the till generates the ESC/POS bytes and the **branch** relays them to the printer on
+  the shop LAN (`host:port`, default 9100). Only the branch opens the socket (decision 16). The bytes
+  travel as base64 inside JSON — a transport encoding — and the branch writes the decoded raw bytes
+  to the socket (`POST /api/branch/print`).
+
+```bash
+# Configure a branch's network printer (a branch member's token; org comes from the token)
+curl -X PUT https://cloud.example/api/pos/printer \
+  -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+  -d '{"mode": "network", "host": "192.168.1.50", "port": 9100}'
+
+# Print a test slip
+curl -X POST https://cloud.example/api/pos/printer/test -H "Authorization: Bearer <token>"
+```
+
+**The printer table.** `public.printer_settings` (org + branch) carries `org_id`, `created_at`, forced
+RLS and the standard indexes, and is registered in `scripts/check-tenant-tables.sql`.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
