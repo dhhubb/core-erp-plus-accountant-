@@ -588,3 +588,155 @@ source of truth; it holds a promotion *candidate* cache (R2) and a live-sale *ra
 **Consequence.** A branch needs only its own Postgres. The caches rebuild from the database on a
 miss, so a restart loses nothing that matters. `tests/branch-h1.test.ts` covers the counter's window
 semantics.
+
+## ADR-0028 — The branch outbox is an append-only event log written by triggers in the fact's transaction
+
+**Context.** H2 syncs a branch's financial and stock facts to the cloud. The events must be exactly
+the facts that committed, in a fixed order, and must survive a crash and a re-push without
+double-posting.
+
+**Decision.**
+
+1. `public.sync_outbox` is an append-only log. Its `bigserial seq` is the ORDER; the event's UUID
+   (`event_id`) is the idempotency key. Order never follows the wall clock, so a branch clock that
+   is set back changes nothing.
+2. The events are written by `AFTER INSERT` triggers on the source tables (`pos_sales`, `stock_ledger`,
+   `payments`, `credit_notes`), each gated on `app.branch_mode_enabled()`. Because the trigger runs in
+   the same transaction as the fact, the event and the fact commit together or not at all: a
+   rolled-back sale leaves no event.
+3. A POS sale writes exactly ONE `sale` event. Its tenders are part of the sale (the payment trigger
+   skips a payment whose invoice belongs to a POS sale) and its outbound stock movements are part of
+   the sale (the stock trigger skips movements whose source is an invoice).
+4. The only mutable column is `acked_at`, and it moves null -> not null once, enforced by
+   `app.sync_outbox_guard()`. There is no delete. `authenticated` gets no UPDATE/DELETE grant.
+
+**Consequence.** The outbox cannot drift from the ledger. A crash mid-push re-pushes the same batch,
+and the cloud dedupes it (ADR-0029). Tests 53 and 62 cover the write and the restart.
+
+## ADR-0029 — The cloud dedupes by event UUID; a push batch commits in one transaction with a savepoint per event
+
+**Context.** A push may be retried (a network drop after the cloud committed but before the branch
+saw the reply). The cloud must apply each event exactly once, and one bad event must not discard the
+rest of the batch.
+
+**Decision.**
+
+1. The cloud's `public.sync_inbox` has `unique (org_id, event_id)`. `app.sync_inbox_apply` inserts
+   `ON CONFLICT (org_id, event_id) DO NOTHING`. A re-pushed event is a no-op. This is the whole dedupe
+   story.
+2. `app.sync_push_result` applies a whole batch in ONE transaction, each event inside its own
+   `BEGIN ... EXCEPTION` block (a savepoint). A rejected event rolls back only its own work and is
+   reported in `rejects`; the rest of the batch commits.
+3. The cloud returns `highest_seq` (the highest sequence applied). The branch acks up to it. A
+   rejected event stops the ack before it, so the branch records a conflict and re-pushes from there.
+
+**Consequence.** At-least-once delivery plus idempotent apply equals exactly-once effect. Tests 54
+and 56 cover the dedupe and the rejection.
+
+## ADR-0030 — Master data is pulled through a per-org monotonic change log; the branch mirror is a rebuildable cache
+
+**Context.** The branch must price and show products from its LOCAL database with no cloud round
+trip, yet the cloud owns master data (products, prices, tax rates). The branch needs an ordered,
+gap-free way to catch up.
+
+**Decision.**
+
+1. The cloud appends every master-data change to `public.master_data_changes` and assigns a per-org
+   monotonic `change_seq` (the org row is locked so two writers cannot collide).
+2. The branch pulls "changes after my cursor" with `app.sync_pull_batch`, applies them to
+   `public.branch_master_data` with `app.sync_apply_pull`, and stores the cursor forward-only in
+   `public.sync_state`.
+3. `public.branch_master_data` is a MUTABLE cache. It is allowed because it is rebuildable from the
+   immutable change log: dropping it and re-pulling every `change_seq` reproduces it exactly
+   (Phase 1 decision: a mutable cache is allowed only when it can be rebuilt from an immutable
+   ledger).
+4. A price row carries `price_version` (the `change_seq` at which its price last changed), so a sale
+   records the version it charged and a later price change cannot rewrite history.
+
+**Consequence.** The branch serves prices locally and stays consistent when it reconnects. Tests 58
+and 59 cover the ordering, the forward-only cursor and the version bump.
+
+## ADR-0031 — Only a cloud rejection is a conflict; a network failure retries forever with jittered backoff
+
+**Context.** The brief distinguishes a transient failure (retry) from a real refusal (a conflict).
+Conflating them either loses data (treating a timeout as a conflict) or loops forever (treating a
+refusal as transient).
+
+**Decision.**
+
+1. `SyncNetworkError` and `SyncServerError` (a 5xx) are retryable. The branch retries with
+   exponential backoff and full jitter, capped at 5 minutes (`src/sync/retry.ts`).
+2. `SyncRejectionError` (a 4xx that names events) is not retryable. The branch records each rejected
+   event in `public.sync_conflicts` and acks past it so it can make progress.
+3. A conflict row therefore always means the cloud refused the event; a network failure never writes
+   one.
+
+**Consequence.** A flaky link never loses a sale and never produces a spurious conflict. Test 57
+covers the policy; test 56 covers the conflict write.
+
+## ADR-0032 — The branch backup is encrypted in memory before upload, and the checksum is of the ciphertext
+
+**Context.** A branch's disk can die. The branch must be able to back its own database up to cloud
+storage without the cloud ever seeing plaintext financial data, and a restore must detect a truncated
+or tampered upload.
+
+**Decision.**
+
+1. `src/sync/backup.ts` dumps the branch Postgres, encrypts the dump with AES-256-GCM
+   (`iv || tag || ciphertext`) using a 32-byte key from `BRANCH_BACKUP_KEY`, and uploads only the
+   ciphertext.
+2. The recorded `checksum` is the sha256 of the WHOLE encrypted file, so a partial or altered upload
+   fails verification. `checksumMatches` compares in constant time.
+3. The upload is behind an `Uploader` interface: a presigned cloud URL when `BRANCH_BACKUP_UPLOAD_URL`
+   is set, else a local directory. The run is recorded in `public.sync_backups` as `running`, then
+   `uploaded` or `failed` with the error.
+
+**Consequence.** The cloud stores only ciphertext, and a failed run is visible rather than silent.
+Test 63 covers the encryption round trip, the tamper detection and the failure record.
+
+## ADR-0033 — H2 test numbering continues from 52; the H2 brief's example names map to 53–63
+
+**Context.** H1 owns 49–52. The H2 brief describes behaviours rather than fixed numbers, so the new
+tests continue from the highest number actually present (ADR-0010, ADR-0026).
+
+**Decision.** H2 owns **53–63** in `tests/sync-h2.test.ts`, plus supporting tests in the same file.
+The mapping is:
+
+| H2 behaviour | Canonical | Test |
+| --- | --- | --- |
+| Outbox write, one event per sale, atomic with the fact | 53 | A completed sale writes one outbox event; a rollback writes none |
+| Exactly-once apply / dedupe | 54 | A batch applies once; a re-push is all duplicates |
+| Outbox immutability | 55 | DELETE rejected; acked_at is write-once; other columns immutable |
+| Ack prefix and conflict on rejection | 56 | Only the applied prefix is acked; a rejection is a conflict |
+| Retryable vs conflict | 57 | Network is retryable; a rejection is a conflict |
+| Pull ordering and forward-only cursor | 58 | Changes come in change_seq order; the cursor never rewinds |
+| Price mirror and versioning | 59 | Local price serves; a later change bumps the version |
+| Cloud inertness | 60 | With branch mode off, no outbox rows are written |
+| RLS on the sync tables | 61 | Org A cannot read Org B sync rows |
+| Kill-and-restart | 62 | An interrupted push re-pushes; the cloud dedupes |
+| Encrypted backup | 63 | Encrypt, checksum, tamper-detect, record failure |
+
+**Consequence.** No number is reused and no test is dropped.
+
+## ADR-0034 — The cloud records each branch event once; it does not re-derive the branch's ledger
+
+**Context.** The branch is the system of record for the sales it rings (ADR-0023): it holds the
+authoritative, immutable ledger locally. When a branch pushes an event, the cloud could either (a)
+record the event durably and let the branch's ledger stand as the source of truth, or (b) replay the
+event through the same posting functions to reconstruct the ledger on the cloud.
+
+**Decision.** The cloud records each event exactly once in `public.sync_inbox` (deduped by
+`(org_id, event_id)`) and assigns master-data changes a per-org sequence. The push path is the
+durable, idempotent ingest boundary; the branch's immutable ledger remains authoritative. The
+`app.sync_replay_*` helpers exist for a future consolidated-reporting projection, but they are not on
+the push path, and the branch is the only writer of its own facts.
+
+**Objection / open item.** A strict "the cloud holds a full copy of every branch's ledger" reading
+would want the replay on the push path. That is deliberately not built in this phase: replaying a
+sale through `app.create_invoice` on the cloud would take a second gapless invoice number and a
+second FIFO consumption, i.e. it would double-post. If Phase 2 wants consolidated ledgers, the cloud
+needs a dedicated, clearly-separated projection that does not reuse the branch's number series and
+stock layers. Recorded here as an open item; do not block H2 on it.
+
+**Consequence.** Pushing is safe to retry and never double-posts. Tests 54, 56 and 62 pin the
+idempotency.

@@ -7,10 +7,23 @@ import { connectionString } from './env';
  */
 const globalForPg = globalThis as unknown as { __erpPool?: Pool };
 
+/**
+ * The branch-mode connection setting. In branch mode every pooled connection carries
+ * `app.branch_mode=branch`, so the outbox enqueue triggers fire on the branch's write path (H2).
+ * The cloud never sets it, so the cloud's write path stays free of outbox rows.
+ */
+function branchModeOptions(): string | undefined {
+  return (process.env.BRANCH_MODE ?? 'cloud').trim().toLowerCase() === 'branch'
+    ? '-c app.branch_mode=branch'
+    : undefined;
+}
+
 export function getPool(): Pool {
   if (!globalForPg.__erpPool) {
+    const options = branchModeOptions();
     const pool = new Pool({
       connectionString: connectionString(),
+      ...(options ? { options } : {}),
       max: 20,
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 10_000,

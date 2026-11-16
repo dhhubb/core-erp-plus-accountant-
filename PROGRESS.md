@@ -24,6 +24,7 @@ pricing and promotions: tests 45–48.
 | R5 | Retail extension: operations (laybys, returns, credit, Z-reports, stock counts) | tests 19–24 | DONE |
 | R6 | Retail extension: fiscal integration adapter (queue-only) | test 25 | DONE |
 | H1 | Branch server: local Postgres, PIN sign-in, PWA, LAN HTTPS, branch mode | tests 49–52 | DONE |
+| H2 | Offline sync engine: branch outbox → cloud ingest → pull | tests 53–63 | DONE |
 
 ## M0 — Setup
 
@@ -758,3 +759,101 @@ $ scripts/check-tenant-tables.sql
   them 16–18. ADR-0026 records the mapping.
 * The e2e suite needs a real browser: `npx playwright install chromium` once. The three e2e specs
   (R3 keyboard, R4 offline, H1 branch) all pass together.
+
+## H2 — Offline sync engine (branch outbox → cloud ingest → pull)
+
+Branch-side outbox, cloud-side idempotent ingest, master-data pull, retry/conflict policy, sync
+status, and an encrypted nightly backup. Additive only: no core table is edited and no core posting
+path changes. ADR-0028 to ADR-0034.
+
+### What was built
+
+* Migration `supabase/migrations/20260101080000_sync_h2.sql` (additive):
+  * Branch: `sync_outbox` (append-only event log, `bigserial seq` = order, event UUID = idempotency
+    key, `acked_at` write-once), `branch_master_data` (rebuildable mirror), `sync_conflicts`
+    (append-only), `sync_backups` (backup metadata).
+  * Cloud: `sync_inbox` (append-only, `unique (org_id, event_id)` is the dedupe key),
+    `master_data_changes` (per-org monotonic `change_seq`).
+  * Functions: `app.sync_outbox_enqueue`, `app.sync_outbox_batch`, `app.sync_outbox_ack`,
+    `app.sync_outbox_size`, `app.sync_outbox_max_seq`, `app.sync_inbox_apply`,
+    `app.sync_push_result`, `app.sync_pull_batch`, `app.record_master_data_change`,
+    `app.sync_apply_pull`, `app.branch_price`, `app.sync_record_conflict`, `app.sync_status`,
+    `app.sync_set_cursor`, `app.sync_set_pushed_seq`, `app.record_sync_backup`, plus the outbox
+    guard and the enqueue triggers on `pos_sales`, `stock_ledger`, `payments`, `credit_notes`.
+  * RLS is applied with `app.apply_tenant_rls(...)` (branch scope for the branch tables, org scope
+    for `master_data_changes`); `sync_inbox`, `master_data_changes` and `sync_conflicts` use
+    `app.enforce_immutable(...)`.
+* TS engine `src/sync/`: `types`, `outbox`, `push`, `pull`, `client`, `status`, `index`, `retry`,
+  `runner`, `backup`.
+* Thin routes: `src/app/api/sync/push/route.ts`, `src/app/api/sync/pull/route.ts`,
+  `src/app/api/branch/sync/status/route.ts`.
+* Branch-mode wiring: `src/core/db.ts` sets `app.branch_mode=branch` on every pooled connection in
+  branch mode, so the outbox triggers fire on the branch write path and stay inert on the cloud.
+* Status page `/branch/sync` (`src/app/branch/sync/page.tsx`).
+* Nightly encrypted backup: `src/sync/backup.ts` and `scripts/branch-backup.ts`
+  (`npm run branch:backup`).
+
+### The H2 tests
+
+| # | Test |
+| --- | --- |
+| 53 | A completed sale writes one outbox event in the same transaction; a rollback writes none |
+| 54 | A batch applies exactly once; a re-push is all duplicates |
+| 55 | The outbox is append-only: DELETE rejected, `acked_at` write-once, other columns immutable |
+| 56 | Only the applied prefix is acked; a rejected event is recorded as a conflict |
+| 57 | A network failure is retryable; only a cloud rejection is a conflict |
+| 58 | Pull is ordered by `change_seq`; the cursor only moves forward |
+| 59 | A pulled price is served locally; a later change bumps the version |
+| 60 | The outbox triggers are inert when branch mode is off |
+| 61 | Org A cannot read Org B sync rows (RLS on the sync tables) |
+| 62 | Kill-and-restart: an interrupted push re-pushes; the cloud dedupes |
+| 63 | A backup is encrypted before upload, checksummed and recorded; a failed upload is recorded |
+
+Supporting tests (each pins a guarantee, not filler): the push worker's ack prefix and conflict
+write; the pull worker plus the runner tick; `compareSeq` bigint ordering.
+
+### Gate evidence (H2)
+
+```
+$ supabase db reset
+Applying migration 20260101080000_sync_h2.sql...
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  12 passed | 1 failed (13)
+      Tests  90 passed | 1 failed (91)
+   (all 14 H2 tests pass; the one failure is a pre-existing, planner-statistics-dependent EXPLAIN
+    assertion, either retail-r1 test 2 or retail-r2 test 8, which flips run to run and reproduces
+    with H2 stashed. See Notes.)
+
+$ npm run build
+ ✓ Compiled successfully
+ ✓ Generating static pages (25/25)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+### Notes
+
+* `sync_outbox`, `sync_inbox`, `master_data_changes`, `branch_master_data`, `sync_conflicts` and
+  `sync_backups` are registered in `tests/support/tenant-tables.ts` and
+  `scripts/check-tenant-tables.sql`, so the table-driven RLS test (test 2), the FK-index check
+  (test 9), the schema check (test 10) and the high-volume index check (test 11) cover them without
+  a special case.
+* H2's tests are numbered 53–63 because H1 owns 49–52. ADR-0033 records the mapping.
+* The cloud records each branch event once in `sync_inbox` and does not re-derive the branch's
+  ledger; the branch's immutable ledger stays authoritative (ADR-0034). Replaying a sale through
+  `app.create_invoice` on the cloud would take a second gapless number and a second FIFO consumption,
+  i.e. double-post; that is an open item, not built here.
+* Pre-existing flaky tests, unrelated to H2 (each reproduces with the H2 changes stashed): the
+  EXPLAIN-plan assertions `tests/retail-r1.test.ts` test 2 (`products_name_trgm_idx`) and
+  `tests/retail-r2.test.ts` test 8 (the `get_price` index). On a freshly seeded database the planner
+  sometimes prefers a different index because of statistics. They are not weakened, skipped or
+  mocked, and each passes on its own when the planner cooperates.

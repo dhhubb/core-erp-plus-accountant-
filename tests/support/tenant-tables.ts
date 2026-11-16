@@ -77,6 +77,14 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'device_registrations', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'cashier_pins', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'sync_state', scope: 'branch', highVolume: true, partitioned: false },
+  // H2 (sync engine): branch outbox, cloud inbox, master-data change log, branch mirror,
+  // conflict log and backup metadata.
+  { name: 'sync_outbox', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'sync_inbox', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'master_data_changes', scope: 'org', highVolume: false, partitioned: false },
+  { name: 'branch_master_data', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'sync_conflicts', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'sync_backups', scope: 'branch', highVolume: true, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -512,6 +520,47 @@ export async function seedOneRowPerTenantTable(
   await sql(
     `insert into public.sync_state (org_id, branch_id, protocol_version, cloud_status)
      values ($1, $2, 1, 'offline')`,
+    [orgId, branchId],
+  );
+
+  // H2 (sync engine): outbox, inbox, master-data change log, branch mirror, conflicts, backups.
+  await sql(
+    `insert into public.sync_outbox (org_id, branch_id, event_id, event_type, payload)
+     values ($1, $2, gen_random_uuid(), 'sale', '{"seed": true}'::jsonb)`,
+    [orgId, branchId],
+  );
+
+  await sql(
+    `insert into public.sync_inbox (org_id, branch_id, event_id, event_type, branch_seq, payload)
+     values ($1, $2, gen_random_uuid(), 'sale', 1, '{"seed": true}'::jsonb)`,
+    [orgId, branchId],
+  );
+
+  await sql(
+    `insert into public.master_data_changes
+       (org_id, change_seq, entity_type, entity_id, operation, payload)
+     values ($1, 1, 'product', $2, 'upsert', '{"seed": true}'::jsonb)`,
+    [orgId, productId],
+  );
+
+  await sql(
+    `insert into public.branch_master_data
+       (org_id, branch_id, entity_type, entity_id, payload, change_seq)
+     values ($1, $2, 'product', $3, '{"seed": true}'::jsonb, 1)`,
+    [orgId, branchId, productId],
+  );
+
+  await sql(
+    `insert into public.sync_conflicts
+       (org_id, branch_id, event_id, branch_seq, event_type, reason, detail)
+     values ($1, $2, gen_random_uuid(), 1, 'sale', 'seed', '{"seed": true}'::jsonb)`,
+    [orgId, branchId],
+  );
+
+  await sql(
+    `insert into public.sync_backups
+       (org_id, branch_id, status, object_key, byte_size, checksum)
+     values ($1, $2, 'uploaded', 'seed/backup.dump', 1024, 'seed')`,
     [orgId, branchId],
   );
 

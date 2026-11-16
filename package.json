@@ -8,6 +8,7 @@
     "start": "next start",
     "start:branch": "BRANCH_MODE=branch node scripts/branch-server.mjs",
     "branch:https": "bash scripts/branch-https.sh",
+    "branch:backup": "tsx scripts/branch-backup.ts",
     "lint": "next lint",
     "test": "vitest run --reporter=verbose",
     "test:perf": "tsx scripts/perf.ts",

@@ -30,6 +30,7 @@ migrations, and Prisma usually connects as a role that bypasses RLS.
 - [Retail extension (R5)](#retail-extension-r5)
 - [Retail extension (R6)](#retail-extension-r6)
 - [Branch server (H1)](#branch-server-h1)
+- [Offline sync engine (H2)](#offline-sync-engine-h2)
 - [Adding a vertical module](#adding-a-vertical-module)
 - [Tests, checks and the perf run](#tests-checks-and-the-perf-run)
 
@@ -654,6 +655,55 @@ npm run branch:https                            # writes certs/branch.{crt,key}
 BRANCH_MODE=branch TLS_CERT_FILE=certs/branch.crt TLS_KEY_FILE=certs/branch.key npm run start:branch
 ```
 
+## Offline sync engine (H2)
+
+H2 moves a branch's facts to the cloud and the cloud's master data back to the branch, with the
+cloud offline for as long as it takes. The branch keeps selling; nothing blocks a sale on the cloud.
+See ADR-0028 to ADR-0034.
+
+**The outbox (branch → cloud).** Every financial and stock fact the branch writes also appends one
+event to `public.sync_outbox`, in the same transaction (triggers on `pos_sales`, `stock_ledger`,
+`payments`, `credit_notes`, each gated on `app.branch_mode_enabled()`). A sale is one `sale` event
+that carries its lines and its tenders. The outbox is append-only: the only mutable column is
+`acked_at`, and it is write-once. Its `bigserial seq` is the order; the event UUID is the idempotency
+key.
+
+**Push (branch → cloud).** `POST /api/sync/push` takes a batch, applies it in ONE transaction with a
+savepoint per event, and inserts each into `public.sync_inbox` with `ON CONFLICT (org_id, event_id) DO
+NOTHING`. The cloud dedupes by event UUID, so a retried push never double-posts. It returns the
+highest sequence applied and any rejects. The branch acks only up to the highest applied sequence; a
+rejected event is recorded in `public.sync_conflicts` and stops the ack before it.
+
+**Pull (cloud → branch).** The cloud appends each master-data change (products, prices, tax rates)
+to `public.master_data_changes` with a per-org monotonic `change_seq`. The branch pulls "changes after
+my cursor" (`GET /api/sync/pull`), applies them to `public.branch_master_data`, and advances the
+cursor forward-only in `public.sync_state`. The mirror is a rebuildable cache, so a price is served
+from the local database with no cloud round trip, and a price row carries a `price_version` so a
+later change cannot rewrite the price a past sale charged.
+
+**Retry vs conflict.** A network failure (unreachable, timeout, 5xx) is retried forever with
+exponential backoff and full jitter, capped at 5 minutes; it is never a conflict. Only a rejection
+from the cloud (a 4xx that names events) is a conflict. `src/sync/retry.ts`.
+
+**Status page.** `GET /api/branch/sync/status` (page `/branch/sync`) reads the branch's own database,
+so it answers with the cloud offline: outbox depth, last push and pull, the cloud observation, and
+the newest conflicts.
+
+**Nightly encrypted backup.** `npm run branch:backup` dumps the branch's Postgres, encrypts it with
+AES-256-GCM (`BRANCH_BACKUP_KEY`) in memory, uploads only the ciphertext (a presigned URL when
+`BRANCH_BACKUP_UPLOAD_URL` is set, else `BRANCH_BACKUP_DIR`), and records the run in
+`public.sync_backups`. The recorded checksum is the sha256 of the encrypted file, so a truncated or
+tampered upload is detected.
+
+```bash
+BRANCH_MODE=branch BRANCH_ORG_ID=<org> BRANCH_ID=<branch> \
+  BRANCH_BACKUP_KEY=<64-hex-or-base64-32-bytes> npm run branch:backup
+```
+
+**The sync tables.** Branch-scoped: `sync_outbox`, `sync_inbox`, `branch_master_data`,
+`sync_conflicts`, `sync_backups`. Org-scoped: `master_data_changes`. All carry `org_id`, `created_at`,
+forced RLS and the standard indexes, and are registered in `scripts/check-tenant-tables.sql`.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -716,9 +766,10 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 | 25 | R6: fiscal integration adapter (queue-only) | `tests/fiscal-r6.test.ts` |
 | 49–51 | H1: branch server foundation (device, PIN, health) | `tests/branch-h1.test.ts` |
 | 52 | H1: branch till shows cloud-offline and still sells (e2e) | `e2e/branch-offline.e2e.ts` |
+| 53–63 | H2: offline sync engine (outbox, push, pull, retry, backup) | `tests/sync-h2.test.ts` |
 
 H1's tests are numbered 49–51 because R4 already owns 14–18 and R5 owns 19–24; the H1 brief called
-them 16–18. ADR-0026 records the mapping.
+them 16–18. H2 continues from 52 (ADR-0033). ADR-0026 and ADR-0033 record the mappings.
 
 Test 13 is the keyboard-only Playwright run and test 14 is the offline reload-and-reconnect run;
 both live in `e2e/`. The e2e config starts its own dev server on port 12100 with its own dist dir
