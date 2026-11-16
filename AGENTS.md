@@ -160,6 +160,22 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
 * **Redis is cloud-only.** The live-sale rate limiter and the promotion cache fall back to
   in-process stores in branch mode (`src/branch/cache.ts`); the promotion validity window is still
   re-checked in SQL, so a stale entry cannot apply an expired promotion (ADR-0027).
+* **Never join on an expression when an index exists on the stored column.** Joining staged import
+  rows to `products` on `nullif(btrim(...))` defeated `(org_id, external_code)` and gave a 12.5 M-row
+  nested loop; resolving the rows into a materialised temp table and joining the stored column fixed
+  it (ADR-0044). `nullif(btrim(coalesce(x,'')),'')` is also how every optional import cell is
+  normalised, so watch for it.
+* **Bulk import takes numbers in one block.** One `app.next_number` call per row is one
+  `SELECT ... FOR UPDATE` per row (~0.14 ms); 5,000 rows cost ~700 ms. `app.next_numbers(org, code,
+  count)` locks once and returns a contiguous gapless block. It reads `number_series` directly, so it
+  is only for series without branch blocks (SKU, PO); invoice numbers still use
+  `app.next_number` -> `app.claim_invoice_number`.
+* **Stock is tracked per variant, not per product.** `create_invoice` matches availability on
+  `variant_id is not distinct from ...`, so an opening-stock layer must name a variant or a later
+  sale sees zero. The import resolves the row's barcode, else the product's default variant.
+* **Staging + one-transaction commit beats per-row writes.** The H5 wizard COPYs rows into
+  `import_rows`, validates set-based, then applies the whole file in one SQL function, so a bad file
+  cannot leave half a catalogue behind (test 77) and a re-run is idempotent (natural key per kind).
 
 ## Test numbering
 
@@ -169,6 +185,7 @@ Phase 1 owns 1–40. R1 owns 41–44 (`tests/retail-r1.test.ts`). R2 owns 45–4
 owns 25 (`tests/fiscal-r6.test.ts`). H1 owns 49–51 (`tests/branch-h1.test.ts`) and 52
 (`e2e/branch-offline.e2e.ts`); the H1 brief called them 16–18, but those are taken — ADR-0026 maps
 them. H2 owns 53–63 (`tests/sync-h2.test.ts`, ADR-0033). H3 owns 64–68
-(`tests/fiscal-h3.test.ts`, ADR-0038). A new
+(`tests/fiscal-h3.test.ts`, ADR-0038). H4 owns 69–74 (`tests/hardware-h4.test.ts`,
+ADR-0041). H5 owns 75–85 (`tests/import-h5.test.ts`, ADR-0042). A new
 run continues from the highest number actually present; ranges in `docs/phase2/README.md` are
 indicative only (ADR-0010).
