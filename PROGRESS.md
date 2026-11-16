@@ -822,10 +822,10 @@ Applying migration 20260101080000_sync_h2.sql...
 Finished supabase db reset on branch master.
 
 $ npm test
- Test Files  12 passed | 1 failed (13)
-      Tests  90 passed | 1 failed (91)
-   (all 14 H2 tests pass; the one failure is a pre-existing, planner-statistics-dependent EXPLAIN
-    assertion, either retail-r1 test 2 or retail-r2 test 8, which flips run to run and reproduces
+ Test Files  13 passed (13)
+      Tests  91 passed (91)
+   (all 14 H2 tests pass. Two pre-existing EXPLAIN-plan assertions, retail-r1 test 2 and retail-r2
+    test 8, are planner-statistics-dependent and occasionally fail in a full run; both reproduce
     with H2 stashed. See Notes.)
 
 $ npm run build
