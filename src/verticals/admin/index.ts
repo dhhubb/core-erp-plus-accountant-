@@ -3,6 +3,8 @@ export * from './barcode';
 export * from './catalogue';
 export * from './pricing';
 export * from './priceCsv';
+export * from './opsTypes';
+export * from './ops';
 export * from './outbox';
 export * from './expiry';
 export * from './scanner';

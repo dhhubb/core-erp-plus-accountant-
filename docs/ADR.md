@@ -1242,3 +1242,95 @@ recomputed in TypeScript.
 
 **Consequence.** A discount above the limit, or one with no reason, is refused identically in the
 console and the till (test 106).
+
+## ADR-0059 — A3 owns tests 108–111, and the ops console reuses the R5 functions
+
+**Context.** The A3 brief calls its tests 32–35, but Phase 1 already owns 32–35 (the sales tests in
+`tests/sales.test.ts`). ADR-0010 forbids renumbering: a new run continues from the highest number
+actually present. A2 owns 105–107.
+
+**Decision.** The A3 run owns tests 108–111 in `tests/admin-a3.test.ts`. The operational business
+logic already exists in R5 (`app.create_layby`, `app.complete_layby`, `app.cancel_layby`,
+`app.create_return`, `app.close_shift`, `app.create_stock_count`, `app.close_stock_count`,
+`app.check_credit`). A3 adds the admin reads and the pages on top of them; it re-implements no rule.
+
+**Consequence.** The console and the till cannot drift, because a layby completion, a return refund
+and a shift close all call the same SQL the till calls. Test numbers are allocated in the order items
+are built, so no number is skipped and no two runs collide.
+
+## ADR-0060 — The admin ops reads are SECURITY INVOKER `app.admin_*` functions
+
+**Context.** Every admin request runs as the caller (`authenticated`) with RLS enabled and forced, so
+no admin path may use the service role (ADR-0052). The console needs paged, filtered reads of
+laybys, returns, shifts, Z-reports and stock counts that R5 does not provide.
+
+**Decision.** The A3 migration adds `app.admin_list_laybys`, `app.admin_layby_detail`,
+`app.admin_list_returns`, `app.admin_invoice_returnable_lines`, `app.admin_list_shifts`,
+`app.admin_z_report`, `app.admin_list_stock_counts`, `app.admin_stock_count_detail`,
+`app.admin_stock_count_snapshot`, `app.admin_list_warehouses` and `app.admin_import_stock_count_lines`.
+Every one is `security invoker`, so the caller's RLS scopes the rows; the grant to `authenticated` is
+enough. The route handlers stay thin: they resolve the org, call one function, and map the result.
+
+**Consequence.** An admin can only read a tenant the token scopes, enforced by the database rather
+than by application checks (tests 108–111 drive the routes with a real token). No admin read needs
+the service role.
+
+## ADR-0061 — The layby status filter and the overdue flag are computed in SQL
+
+**Context.** `/admin/laybys` filters by status (active/completed/cancelled) and shows an overdue
+`due_date` in red. The brief's status words are `active`, but the R5 `laybys.status` values are
+`open`, `completed`, `cancelled`.
+
+**Decision.** The page's filter offers All / Active / Completed / Cancelled and sends the schema
+value (`open`) for "Active". The list function computes `is_overdue` as
+`status = 'open' and due_date < current_date` in SQL, so the console never recomputes "today" against
+a due date in TypeScript. An unknown status is refused with 22023 (a 422).
+
+**Consequence.** The overdue flag is consistent for every caller and time zone (the database's
+`current_date`), and the filter maps cleanly between the brief's wording and the schema's values.
+
+## ADR-0062 — The returnable-lines read shares the arithmetic with `app.create_return`
+
+**Context.** The returns page shows, per invoice line, the quantity sold, the quantity already
+returned and the remainder, so the operator cannot type a quantity the database will reject.
+`app.create_return` already checks `qty_sold - qty_already_returned` while holding the invoice lines
+`FOR UPDATE`.
+
+**Decision.** `app.admin_invoice_returnable_lines` returns the same three figures from the same
+source (`invoice_lines` minus completed `return_lines`). The read is a preview only: the authoritative
+check remains inside `app.create_return`, which locks the lines `FOR UPDATE` so two concurrent returns
+cannot each see the same remainder (test 110 asserts both the preview and the refusal).
+
+**Consequence.** The console's preview and the writer's check agree, and the write path keeps its
+lock; a return over the sold quantity is still a 422 from the database.
+
+## ADR-0063 — The admin stocktake import is a set-based insert, not COPY
+
+**Context.** The R5 route imported a stock count's lines with `COPY … FROM STDIN`
+(`importStockCountLines`). `COPY FROM` is not supported under row-level security: the server raises
+SQLSTATE `0A000` ("COPY FROM not supported with row-level security"). Every admin path runs as
+`authenticated` with RLS forced, so the R5 COPY path cannot be reused by the console.
+
+**Decision.** A3 adds `app.admin_import_stock_count_lines(org, branch, count_id, count_created_at,
+lines jsonb)`, a set-based `INSERT … SELECT` from the JSON array, run as the caller
+(`security invoker`). It asserts the header is visible to the caller first, then inserts every line
+in one statement. The console calls this instead of COPY. (The R5 route keeps its COPY path for the
+till's non-RLS contexts; the admin path does not use it.)
+
+**Consequence.** The admin import works under RLS with no service role, and one round trip inserts a
+whole count's lines (test 111 imports and closes a count). A future non-RLS bulk path may still use
+COPY.
+
+## ADR-0064 — The Z-report is read by primary key and shown read-only
+
+**Context.** A Z-report is immutable (`app.enforce_immutable`). The console shows a shift's Z-report
+and lets the operator close an open shift.
+
+**Decision.** `app.admin_z_report(org_id, id)` reads one immutable row by its primary key (no
+scan, no filter beyond the org). The console shows it read-only; the only write is `app.close_shift`
+(via `POST /api/admin/shifts`), which writes the Z-report and closes the shift in one transaction.
+`by_method`, `by_currency` and `vat_by_rate` are JSON objects of amounts; the route serialises each
+to a fixed-scale string.
+
+**Consequence.** Nothing on the console updates or deletes a Z-report, and the read is a single
+indexed lookup (test 111 closes a shift and reads the report back).

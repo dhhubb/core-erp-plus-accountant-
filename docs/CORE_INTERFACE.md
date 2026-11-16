@@ -482,3 +482,39 @@ the rows; no admin path uses the service role.
   `POST /api/admin/pricing-preview`.
 * Pages: `/admin/price-lists`, `/admin/price-lists/[id]/items`, `/admin/customer-groups`,
   `/admin/promotions`, `/admin/pricing-preview`.
+
+## A3 extension (Admin operations UI)
+
+Additive, recorded in ADR-0059 to ADR-0064. It adds **no** core table and **no** core function
+signature change: it adds admin reads and thin pages over the R5 operations SQL, and every business
+rule stays in R5. Every new function is **SECURITY INVOKER**, so the caller's RLS scopes the rows; no
+admin path uses the service role.
+
+* Laybys: `app.admin_list_laybys(org_id, branch_id, status, limit, after_created_at, after_id)`
+  (keyset, optional status filter, `is_overdue` computed as `status = 'open' and due_date <
+  current_date`, ADR-0061), `app.admin_layby_detail(org_id, id)` (the layby, its customer and its
+  reservations). Complete and cancel call R5's `app.complete_layby` / `app.cancel_layby` (ADR-0059);
+  the cancellation fee defaults from `settings.layby_cancellation_fee`.
+* Returns: `app.admin_list_returns(org_id, branch_id, limit, after_created_at, after_id)` (keyset),
+  `app.admin_invoice_returnable_lines(org_id, invoice_id)` (per line: `qty_sold`, `qty_returned`,
+  `qty_returnable`, ADR-0062). The write is R5's `app.create_return`, which locks the invoice lines
+  `FOR UPDATE` and returns stock at the original FIFO cost.
+* Shifts and Z-reports: `app.admin_list_shifts(org_id, branch_id, status, limit, after_created_at,
+  after_id)` (keyset, optional status filter, joined to the Z-report number),
+  `app.admin_z_report(org_id, id)` (one immutable row by primary key, ADR-0064). Closing a shift is
+  R5's `app.close_shift`, which writes the Z-report and closes the shift in one transaction.
+* Stocktake: `app.admin_list_stock_counts(...)` (keyset), `app.admin_stock_count_detail(org_id,
+  count_id, count_created_at)` (header, variance summary), `app.admin_stock_count_snapshot(org_id,
+  warehouse_id)` (the current on-hand quantity and average cost per item), and
+  `app.admin_import_stock_count_lines(org_id, branch_id, count_id, count_created_at, lines jsonb) ->
+  int` (a set-based insert, because COPY FROM is refused under RLS, ADR-0063). Open and close are
+  R5's `app.create_stock_count` / `app.close_stock_count`.
+* Pickers: `app.admin_list_warehouses(org_id, branch_id)` (the branch's active warehouses).
+* TypeScript (`src/verticals/admin/`): `ops.ts` (the data access and the set-based import),
+  `opsTypes.ts` (the A3 types), `OpsNav.tsx` (shared nav).
+* Endpoints: `GET`/`POST /api/admin/laybys` (POST: complete or cancel), `GET /api/admin/laybys/[id]`,
+  `GET`/`POST /api/admin/returns` (POST: create), `GET /api/admin/invoices/[id]/returnable-lines`,
+  `GET`/`POST /api/admin/shifts` (POST: close), `GET /api/admin/z-reports/[id]`,
+  `GET`/`POST /api/admin/stocktake` (POST: open, import lines, or close),
+  `GET /api/admin/stocktake/[id]?created_at=`, `GET /api/admin/warehouses`.
+* Pages: `/admin/laybys`, `/admin/laybys/[id]`, `/admin/returns`, `/admin/shifts`, `/admin/stocktake`.

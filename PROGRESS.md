@@ -30,6 +30,8 @@ pricing and promotions: tests 45–48.
 | H5 | Migration wizard: Pastel CSV → products/customers/opening stock, chunked COPY, mapping, commit | tests 75–85 | DONE |
 | H6 | Reports and the owner console: profit, VAT, Z-reports; branch + cloud | tests 86–95 | DONE |
 | A1 | Admin products UI: categories, products, variants, barcodes, batches (cloud + branch admin) | tests 96–104 | DONE |
+| A2 | Admin pricing UI: price lists, items, customer groups, promotions, live preview | tests 105–107 | DONE |
+| A3 | Admin operations UI: laybys, returns, shifts & Z-reports, stocktake | tests 108–111 | DONE |
 
 ## M0 — Setup
 
@@ -1433,3 +1435,82 @@ $ scripts/check-tenant-tables.sql
   (ADR-0058, test 106).
 * No test is mocked: the A2 tests run against the real local Postgres and the real local Redis, and
   call the route handlers with a real access token.
+
+## A3 — Admin operations UI (laybys, returns, shifts & Z-reports, stocktake)
+
+Additive on top of R5. No core table or function signature changes; every business rule stays in R5
+and the console drives it (ADR-0059). Tests **108–111** in `tests/admin-a3.test.ts`.
+
+### What was built
+
+* **Migration** `supabase/migrations/20260101150000_admin_ops_a3.sql`: the `app.admin_*` reads —
+  `admin_list_laybys`, `admin_layby_detail`, `admin_list_returns`,
+  `admin_invoice_returnable_lines`, `admin_list_shifts`, `admin_z_report`,
+  `admin_list_stock_counts`, `admin_stock_count_detail`, `admin_stock_count_snapshot`,
+  `admin_list_warehouses`, and `admin_import_stock_count_lines`. Every one is `security invoker`,
+  so RLS scopes the rows (ADR-0060).
+* **Backend** `src/verticals/admin/ops.ts` + `opsTypes.ts` (the data access and the set-based
+  stock-count import).
+* **Routes** `/api/admin/laybys` (list + complete/cancel), `/api/admin/laybys/[id]`,
+  `/api/admin/returns` (list + create), `/api/admin/invoices/[id]/returnable-lines`,
+  `/api/admin/shifts` (list + close), `/api/admin/z-reports/[id]`,
+  `/api/admin/stocktake` (open / import / close), `/api/admin/stocktake/[id]`,
+  `/api/admin/warehouses`.
+* **Pages** `/admin/laybys`, `/admin/laybys/[id]`, `/admin/returns`, `/admin/shifts`,
+  `/admin/stocktake` (+ `OpsNav`).
+
+### The four tests
+
+| # | Test |
+| --- | --- |
+| 108 | Layby list filters by status and flags overdue; detail shows deposit, customer, reservations; completing creates a CORE invoice and clears the deposit |
+| 109 | Cancelling a layby posts Dr Customer Deposits / Cr Bank / Cr Fee Income (fee from settings); the route refuses a limit above 100 and another org |
+| 110 | A return locks the invoice lines, cannot exceed the quantity sold, returns stock at the original FIFO cost; the returnable-lines read agrees |
+| 111 | Closing a shift writes one Z-report the console reads; a stocktake snapshots, imports and closes to one balanced journal |
+
+Test numbers continue from A2 (ADR-0010): the brief called these 32–35, but Phase 1 owns 32–35, so
+A3 owns 108–111 (ADR-0059).
+
+### Gate
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.   (all migrations apply to an empty DB)
+
+$ npm test
+ Test Files  23 passed (23)
+      Tests  172 passed (172)
+
+$ npm run build
+✓ Compiled successfully   (incl. /admin/laybys, /admin/laybys/[id], /admin/returns,
+                           /admin/shifts, /admin/stocktake)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+
+$ npm run test:perf
+saved to docs/perf/trial-balance-2026-11-16T15-14-26-876Z.md
+```
+
+### Notes
+
+* **No operations rule is re-implemented.** Complete/cancel layby, create return, close shift and
+  close stock count all call the R5 SQL the till uses (ADR-0059).
+* **No service role.** Every admin read is a `security invoker` `app.admin_*` function; the caller's
+  token scopes the rows (ADR-0060, ADR-0052).
+* **COPY is not available under RLS.** The R5 stock-count import used `COPY FROM`, which the server
+  refuses under row-level security (0A000). A3 replaces it with a set-based
+  `app.admin_import_stock_count_lines` (ADR-0063).
+* **Overdue and the status filter are SQL.** `is_overdue` is `status = 'open' and due_date <
+  current_date`; "Active" maps to the schema value `open` (ADR-0061).
+* **The return preview shares the writer's arithmetic.** `app.admin_invoice_returnable_lines` is a
+  preview; the authoritative check is inside `app.create_return`, which holds the lines `FOR UPDATE`
+  (ADR-0062).
+* No test is mocked: the A3 tests run against the real local Postgres and call the route handlers
+  with a real access token, so RLS is genuinely exercised.

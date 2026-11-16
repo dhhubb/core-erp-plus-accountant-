@@ -939,6 +939,11 @@ every row and a branch pulls the change on its next sync (ADR-0050).
 | `/admin/customer-groups` | Groups mapped to a price list, with their members (contacts) |
 | `/admin/promotions` | Promotions by priority (drag-to-reorder), with an active/type filter |
 | `/admin/pricing-preview` | Live preview of list price → promotion → manual discount, with the role's limit |
+| `/admin/laybys` | Laybys with a status filter; overdue `due_date` in red; complete (CORE invoice) or cancel (refund less fee) |
+| `/admin/laybys/[id]` | One layby: the deposit paid, the customer and the reservations held aside |
+| `/admin/returns` | Create a return against an invoice (returnable-lines lookup) and list past returns |
+| `/admin/shifts` | Till shifts with a status filter; close a shift and read its immutable Z-report |
+| `/admin/stocktake` | Open a count, prefill from the snapshot, import the lines and close it (one CORE adjustment) |
 
 **Endpoints.** `GET`/`POST /api/admin/categories`, `PATCH`/`DELETE /api/admin/categories/[id]`, and
 the same shape for `products`, `variants` and `batches`. A list is a keyset page on
@@ -953,6 +958,18 @@ and `/api/admin/pricing-preview`. The console does not re-implement any pricing 
 does. Items import with COPY into a staging table and one merge (ADR-0055), the same pattern as the
 stocktake. A list is keyed by `kind` (one retail and one wholesale per org, ADR-0056), and a keyset
 cursor keeps microsecond precision so a bulk import pages correctly (ADR-0057).
+
+**Operations (A3).** `/api/admin/laybys` (list + complete/cancel), `/api/admin/laybys/[id]`,
+`/api/admin/returns` (list + create), `/api/admin/invoices/[id]/returnable-lines`,
+`/api/admin/shifts` (list + close), `/api/admin/z-reports/[id]`, `/api/admin/stocktake` (open /
+import / close), `/api/admin/stocktake/[id]` and `/api/admin/warehouses`. These pages drive the R5
+SQL the till already uses (`app.complete_layby`, `app.cancel_layby`, `app.create_return`,
+`app.close_shift`, `app.create_stock_count`/`app.close_stock_count`), so the console and the till
+cannot drift (ADR-0059). Every read is a `security invoker` `app.admin_*` function, so RLS scopes the
+rows and no admin path needs the service role (ADR-0060). The overdue flag and the layby status
+filter are computed in SQL (ADR-0061); the returnable-lines preview shares its arithmetic with
+`app.create_return`, which still holds the lines `FOR UPDATE` (ADR-0062); the stocktake import is a
+set-based insert rather than COPY, which RLS forbids (ADR-0063).
 
 **Barcodes.** A 13-digit barcode must carry a valid EAN-13 check digit, checked in SQL
 (`app.is_valid_ean13`) and mirrored in TypeScript (`src/verticals/admin/barcode.ts`). Anything else
