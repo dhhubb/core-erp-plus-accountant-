@@ -376,6 +376,30 @@ describe('H4 checkout and printing', () => {
     expect(order).toEqual([]);
   });
 
+  it('does not fail the sale when the printer transport throws', async () => {
+    const transport: PrinterTransport = {
+      kind: 'network',
+      async send() {
+        throw new Error('printer 192.168.1.50:9100 timed out');
+      },
+    };
+
+    // The sale committed; a wedged printer must not turn a paid sale into an error.
+    const result = await checkoutAndPrint({
+      postSale: async () => sampleSale(),
+      settings: { mode: 'network', host: '192.168.1.50', port: 9100, label: 'default' },
+      transport,
+      cashier: 'T1',
+      zwgRate: new Decimal('30'),
+      date: FIXED_DATE,
+      now: () => 1_000,
+    });
+
+    expect(result.receipt.invoiceNo).toBe('000123');
+    expect(result.print.printed).toBe(false);
+    expect(result.print.reason).toContain('timed out');
+  });
+
   it('builds a printable receipt whose totals match the sale', async () => {
     const result = await checkoutAndPrint({
       postSale: async () => sampleSale(),

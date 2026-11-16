@@ -1055,7 +1055,7 @@ Finished supabase db reset on branch master.   (all 21 migrations applied)
 
 $ npm test
  Test Files  18 passed (18)
-      Tests  134 passed (134)
+      Tests  135 passed (135)
 
 $ npm run build
 BUILD_EXIT=0   (✓ Compiled successfully; /pos, /pos/settings, /api/pos/printer, /api/branch/print)
@@ -1084,5 +1084,8 @@ $ scripts/check-tenant-tables.sql
   keyboard sale intact (the R3 e2e test still passes).
 * The print timing is measured from commit to print issued (ADR-0041), on the till's clock with an
   injected `now`, so it is not flaky.
+* Printing never fails the sale. `printReceipt` catches a transport error and returns
+  `{ printed: false, reason }`, so a wedged printer or an unreachable relay is reported after the
+  sale has committed rather than turning a paid sale into an error (asserted in the units test).
 * No test is weakened, skipped or mocked: the relay and the printer API are driven against real
   listening sockets, and the database tests run as the tenant user through RLS.

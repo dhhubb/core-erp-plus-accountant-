@@ -187,7 +187,18 @@ export async function printReceipt(
   transport: PrinterTransport,
 ): Promise<PrintResult> {
   const bytes = generateEscPos(data);
-  return transport.send(bytes);
+  try {
+    return await transport.send(bytes);
+  } catch (error) {
+    // Printing must never fail the sale. The sale has already committed; a printer that is off or a
+    // relay that is unreachable is reported, not thrown, so the till can retry or fall back.
+    return {
+      printed: false,
+      transport: transport.kind,
+      bytes: 0,
+      reason: (error as Error).message,
+    };
+  }
 }
 
 /**
