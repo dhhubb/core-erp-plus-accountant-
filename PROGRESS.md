@@ -22,6 +22,8 @@ pricing and promotions: tests 45–48.
 | R3 | Retail extension: online POS sale | tests 9–13 | DONE |
 | R4 | Retail extension: offline outbox and sync | tests 14–18 | DONE |
 | R5 | Retail extension: operations (laybys, returns, credit, Z-reports, stock counts) | tests 19–24 | DONE |
+| R6 | Retail extension: fiscal integration adapter (queue-only) | test 25 | DONE |
+| H1 | Branch server: local Postgres, PIN sign-in, PWA, LAN HTTPS, branch mode | tests 49–52 | DONE |
 
 ## M0 — Setup
 
@@ -678,3 +680,81 @@ Notes:
 * The queue is append-only, so delivery state is derived from `fiscal_job_attempts`: a `sent`
   attempt marks a job done and the job row is never updated. `app.fiscal_jobs_due` is the single
   source of truth for the exponential backoff, so the worker and the database agree on timing.
+
+## H1 — Branch server (local Postgres, PIN sign-in, PWA, LAN HTTPS, branch mode)
+
+Status: **complete**. Gate evidence below.
+
+### What was built
+
+* `supabase/migrations/20260101070000_branch_h1.sql` (additive, ADR-0023): branch-scoped
+  `device_registrations` (one-time code → device token; only sha256 hashes stored),
+  `cashier_pins` (bcrypt hash, lockout state, manager flag), `sync_state` (protocol version and
+  push/pull cursors). Functions: `app.branch_protocol_version`, `app.hash_secret`,
+  `app.create_device_registration`, `app.register_device`, `app.authenticate_device`,
+  `app.set_cashier_pin`, `app.authenticate_cashier`, `app.manager_override`, `app.branch_sync_state`,
+  `app.record_cloud_contact`. All three tables go through `app.apply_tenant_rls` (branch scope) and
+  the standard index rules.
+* `src/branch/`: `config.ts` (`isBranchMode`, `BRANCH_PROTOCOL_VERSION`), `connectivity.ts`
+  (`probeCloud`), `pin.ts`, `device.ts`, `session.ts` (`signInWithPin`), `health.ts` (`branchHealth`,
+  `databaseUp`), `cache.ts` (in-process counter and promo cache), `useBranchHealth.ts`,
+  `RegisterServiceWorker.tsx`, `index.ts`.
+* Thin routes: `src/app/api/branch/health/route.ts`, `login/route.ts`, `devices/route.ts`.
+* Branch-mode wiring: `src/verticals/pos/rateLimit.ts` and `src/verticals/retail/pricing.ts` use the
+  in-process stores when `isBranchMode()`; the cloud path is unchanged (ADR-0027).
+* PWA: `public/manifest.webmanifest`, `public/sw.js` (never caches `/api/`), root layout metadata,
+  and a cloud-status badge on `/pos` polled from the branch (not `navigator.onLine`).
+* LAN HTTPS: `scripts/branch-https.sh` (self-signed cert) and `scripts/branch-server.mjs` (serves the
+  build over HTTPS when TLS env vars are set). Scripts `branch:https` and `start:branch`.
+
+### The H1 tests
+
+| # | Test |
+| --- | --- |
+| 49 | A device is registered with a one-time code; only hashes are stored, and the code is single use |
+| 50 | A cashier signs in with a PIN verified locally; five wrong PINs lock it; manager override |
+| 51 | Branch health reports the cloud offline when unreachable; the branch keeps selling |
+| 52 | e2e: the branch till shows cloud-offline and still sells on the LAN |
+
+Supporting tests (each pins a guarantee, not filler): the in-process counter's window semantics; a
+PIN stored through the TS wrapper is never plaintext; the HTTPS script issues a cert whose SAN
+carries the LAN host.
+
+### Gate evidence (H1)
+
+```
+$ supabase db reset
+Applying migration 20260101070000_branch_h1.sql...
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  12 passed (12)
+      Tests  77 passed (77)
+
+$ npx playwright test
+ 3 passed (36.3s)
+
+$ npm run build
+ ✓ Compiled successfully
+ ✓ Generating static pages (24/24)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+### Notes
+
+* `device_registrations`, `cashier_pins` and `sync_state` are registered in
+  `tests/support/tenant-tables.ts` and `scripts/check-tenant-tables.sql`, so the table-driven RLS
+  test (test 2), the FK-index check (test 9), the schema check (test 10) and the high-volume index
+  check (test 11) cover them without a special case.
+* H1's tests are numbered 49–51 (e2e 52) because R4 owns 14–18 and R5 owns 19–24; the H1 brief called
+  them 16–18. ADR-0026 records the mapping.
+* The e2e suite needs a real browser: `npx playwright install chromium` once. The three e2e specs
+  (R3 keyboard, R4 offline, H1 branch) all pass together.

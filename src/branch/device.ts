@@ -1,0 +1,46 @@
+import type { PoolClient } from 'pg';
+
+/**
+ * Device registration (decision 12).
+ *
+ * A till is registered with a one-time code. The code is created by an admin (in the cloud or on
+ * the branch admin page), entered once on the till, and redeemed for a device token. Only the hash
+ * of the code and the hash of the issued token are stored; the raw values exist only in the
+ * response. This is the same pattern as an invite token (ADR-0024).
+ */
+
+/** Mint a one-time device registration code. Returns the raw code, which is shown once. */
+export async function createDeviceRegistration(
+  client: PoolClient,
+  input: { orgId: string; branchId: string; tillId: string; ttlHours?: number },
+): Promise<string> {
+  const result = await client.query<{ app: string }>(
+    'select app.create_device_registration($1, $2, $3, $4) as app',
+    [input.orgId, input.branchId, input.tillId, input.ttlHours ?? 24],
+  );
+  return result.rows[0]!.app;
+}
+
+/** Redeem a one-time code for a device token. Single use; the code is consumed. */
+export async function registerDevice(
+  client: PoolClient,
+  input: { orgId: string; branchId: string; code: string; label?: string | null },
+): Promise<string> {
+  const result = await client.query<{ app: string }>(
+    'select app.register_device($1, $2, $3, $4) as app',
+    [input.orgId, input.branchId, input.code, input.label ?? null],
+  );
+  return result.rows[0]!.app;
+}
+
+/** Verify a device token. Returns the registration id; raises when the token is invalid. */
+export async function authenticateDevice(
+  client: PoolClient,
+  input: { orgId: string; branchId: string; token: string },
+): Promise<string> {
+  const result = await client.query<{ app: string }>(
+    'select app.authenticate_device($1, $2, $3) as app',
+    [input.orgId, input.branchId, input.token],
+  );
+  return result.rows[0]!.app;
+}

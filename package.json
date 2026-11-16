@@ -6,6 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "start:branch": "BRANCH_MODE=branch node scripts/branch-server.mjs",
+    "branch:https": "bash scripts/branch-https.sh",
     "lint": "next lint",
     "test": "vitest run --reporter=verbose",
     "test:perf": "tsx scripts/perf.ts",

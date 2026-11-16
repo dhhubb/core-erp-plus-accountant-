@@ -32,6 +32,9 @@ npm test                       # all tests, against real Postgres
 npm run build                  # next build
 npm run lint                   # includes the no-any rule for src/accounting
 npm run test:perf              # 1M-line trial balance; writes docs/perf/
+npm run test:e2e               # Playwright (R3 keyboard, R4 offline, H1 branch)
+npm run branch:https           # H1: issue a self-signed LAN certificate
+BRANCH_MODE=branch npm run start:branch   # H1: serve the build for a branch
 psql "$DATABASE_URL" -f scripts/check-fk-indexes.sql     # must be 0 rows
 psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
 ```
@@ -120,12 +123,34 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
 * **There is no blocking fiscal mode, on purpose.** The mode check constraint is `mode in ('none',
   'async')`. Whether ZIMRA requires printing at the moment of sale is an open item (ADR-0022); a
   blocking mode is a separate future run with its own ADR. Nothing in R6 is a compliance claim.
+* **Branch mode is one codebase and one migration set.** `BRANCH_MODE=branch` (default `cloud`)
+  gates every branch path through `isBranchMode()` (`src/branch/config.ts`). A branch runs the same
+  migrations and the same posting functions; H1 adds only additive tables and functions, no core
+  edits (ADR-0023). The cloud path is byte-for-byte unchanged when the variable is unset.
+* **Device codes and tokens are stored hashed, never in plaintext.** `app.create_device_registration`
+  stores only the sha256 of the one-time code; `app.register_device` stores only the sha256 of the
+  issued token and consumes the code once. `app.hash_secret` is the shared hash (ADR-0024). The test
+  asserts the stored values are 64-hex digests and the code is single use.
+* **Cashier PINs are bcrypt, checked locally.** `app.set_cashier_pin` stores a bcrypt hash;
+  `app.authenticate_cashier` returns jsonb (`ok`, `locked`, `failed_attempts`, `locked_until`,
+  `is_manager`) and never raises for a wrong PIN — five wrong attempts lock it for 15 minutes.
+  `app.manager_override` is the manager path (ADR-0024). The branch mints its own access token after
+  a PIN check; there is no Supabase Auth in branch mode.
+* **The till reads connectivity from the branch, not the browser.** `GET /api/branch/health` reports
+  the branch's stored observation of the cloud; `navigator.onLine` is wrong on a LAN with the
+  internet down. `?probe=1` refreshes the observation with a short timeout (never hangs). A version
+  mismatch is `incompatible` and sets `push_blocked` (ADR-0025).
+* **Redis is cloud-only.** The live-sale rate limiter and the promotion cache fall back to
+  in-process stores in branch mode (`src/branch/cache.ts`); the promotion validity window is still
+  re-checked in SQL, so a stale entry cannot apply an expired promotion (ADR-0027).
 
 ## Test numbering
 
 Phase 1 owns 1–40. R1 owns 41–44 (`tests/retail-r1.test.ts`). R2 owns 45–48
 (`tests/retail-r2.test.ts`). R3 owns 9–13 (`tests/pos-r3.test.ts` plus the keyboard e2e). R4 owns
 14–18 (`tests/pos-r4.test.ts` plus the offline e2e). R5 owns 19–24 (`tests/ops-r5.test.ts`). R6
-owns 25 (`tests/fiscal-r6.test.ts`). A new
+owns 25 (`tests/fiscal-r6.test.ts`). H1 owns 49–51 (`tests/branch-h1.test.ts`) and 52
+(`e2e/branch-offline.e2e.ts`); the H1 brief called them 16–18, but those are taken — ADR-0026 maps
+them. A new
 run continues from the highest number actually present; ranges in `docs/phase2/README.md` are
 indicative only (ADR-0010).

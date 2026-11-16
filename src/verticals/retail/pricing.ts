@@ -1,6 +1,8 @@
 import Decimal from 'decimal.js';
 import { money, moneyFromSql } from '../../core/money';
 import { getRedis } from '../../core/redis';
+import { inProcessPromoCache } from '../../branch/cache';
+import { isBranchMode } from '../../branch/config';
 
 /**
  * The promotion candidate cache. Redis holds candidates only (never a resolved price), the key is
@@ -22,6 +24,11 @@ export interface PromoCache {
 
 /** Adapt the shared ioredis client to the PromoCache shape this module depends on. */
 export function defaultPromoCache(): PromoCache {
+  // Redis is cloud-only (decision 13). A branch caches candidates in-process instead; the validity
+  // window is still re-checked in SQL at evaluation time, so a stale entry cannot apply an expired
+  // promotion on either side.
+  if (isBranchMode()) return inProcessPromoCache();
+
   const redis = getRedis();
   return {
     get: (key) => redis.get(key),

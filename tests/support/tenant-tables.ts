@@ -73,6 +73,10 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'fiscal_device_integration', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'fiscal_jobs', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'fiscal_job_attempts', scope: 'branch', highVolume: true, partitioned: false },
+  // H1 (branch server): device registration, local PIN auth, sync state.
+  { name: 'device_registrations', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'cashier_pins', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'sync_state', scope: 'branch', highVolume: true, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -489,6 +493,26 @@ export async function seedOneRowPerTenantTable(
        (org_id, branch_id, job_id, attempt_no, outcome, error)
      values ($1, $2, $3, 1, 'unreachable', 'seed')`,
     [orgId, branchId, fiscalJob[0]!.id],
+  );
+
+  // H1 (branch server): device registration, local PIN auth, sync state.
+  await sql(
+    `insert into public.device_registrations
+       (org_id, branch_id, till_id, code_hash, code_expires_at, consumed_at, device_token_hash)
+     values ($1, $2, $3, $4, now() + interval '24 hours', now(), $5)`,
+    [orgId, branchId, `TILL-${randomUUID().slice(0, 8)}`, randomUUID(), randomUUID()],
+  );
+
+  await sql(
+    `insert into public.cashier_pins (org_id, branch_id, cashier_id, pin_hash, is_manager)
+     values ($1, $2, $3, extensions.crypt('1234', extensions.gen_salt('bf', 10)), true)`,
+    [orgId, branchId, userId],
+  );
+
+  await sql(
+    `insert into public.sync_state (org_id, branch_id, protocol_version, cloud_status)
+     values ($1, $2, 1, 'offline')`,
+    [orgId, branchId],
   );
 
   return {

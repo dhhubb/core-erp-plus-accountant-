@@ -29,6 +29,7 @@ migrations, and Prisma usually connects as a role that bypasses RLS.
 - [Retail extension (R4)](#retail-extension-r4)
 - [Retail extension (R5)](#retail-extension-r5)
 - [Retail extension (R6)](#retail-extension-r6)
+- [Branch server (H1)](#branch-server-h1)
 - [Adding a vertical module](#adding-a-vertical-module)
 - [Tests, checks and the perf run](#tests-checks-and-the-perf-run)
 
@@ -606,6 +607,53 @@ the moment of sale is an open item in `docs/ADR.md`.
   route ships the unreachable transport, which performs no network call; a real device transport is
   a future run.
 
+## Branch server (H1)
+
+A branch runs the same codebase and the same migrations as the cloud, on the shop LAN, with the
+internet down. `BRANCH_MODE` switches the branch-only behaviour on; the default is `cloud`, so an
+unset variable is never branch mode. See ADR-0023 to ADR-0027.
+
+What a branch is:
+
+- **One codebase, one migration set.** A branch runs `supabase/migrations/` unchanged. H1 adds only
+  additive tables and functions; no core table is edited. `BRANCH_MODE=branch` gates the branch
+  paths (`isBranchMode()`), so the cloud path is untouched.
+- **Local Postgres, local sign-in.** A branch runs a local Postgres and a local PIN sign-in. There
+  is no Supabase Auth in branch mode: `POST /api/branch/login` verifies a cashier's PIN locally
+  (bcrypt hash in `cashier_pins`) and mints a branch access token. Five wrong PINs lock the PIN for
+  15 minutes; a manager PIN authorises an override (`app.manager_override`).
+- **Device registration.** A till is registered with a one-time code (`app.create_device_registration`)
+  that is redeemed once (`app.register_device`) for a device token. Only the sha256 hashes of the
+  code and the token are stored — never the plaintext — exactly like an invite token (ADR-0024).
+  Endpoints: `POST /api/branch/devices` with `action: create | register | verify`.
+- **Connectivity from the branch, not the browser.** The till polls `GET /api/branch/health` and
+  shows a badge. It does not trust `navigator.onLine`: a LAN with the internet down reports the
+  cloud as offline, which is the truth the till must show. `?probe=1` refreshes the branch's
+  observation of the cloud (short timeout; never hangs).
+- **A sync protocol version.** The branch and the cloud carry a version
+  (`app.branch_protocol_version()` and `BRANCH_PROTOCOL_VERSION`). A reachable cloud on a different
+  version is `incompatible`: the branch refuses to push and the till shows a warning, while still
+  selling locally (ADR-0025).
+- **No Redis on a branch.** Redis is cloud-only. The live-sale rate limiter and the promotion
+  candidate cache fall back to in-process stores with the same semantics (ADR-0027); the promotion
+  validity window is still re-checked in SQL, so a stale entry cannot apply an expired promotion.
+- **HTTPS on the LAN.** A PWA install and IndexedDB need a secure context. `npm run branch:https`
+  issues a self-signed certificate for the branch host; `npm run start:branch` serves the build over
+  HTTPS when `TLS_CERT_FILE`/`TLS_KEY_FILE` are set, and over HTTP otherwise.
+- **Installable till.** `public/manifest.webmanifest` and `public/sw.js` make `/pos` installable. The
+  service worker never caches `/api/`; the offline path is the IndexedDB outbox (R4), not a stale
+  response.
+
+Run a branch locally:
+
+```bash
+npm run build
+BRANCH_MODE=branch npm run start:branch        # HTTP on 0.0.0.0:3000
+# or, with TLS on the LAN:
+npm run branch:https                            # writes certs/branch.{crt,key}
+BRANCH_MODE=branch TLS_CERT_FILE=certs/branch.crt TLS_KEY_FILE=certs/branch.key npm run start:branch
+```
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -666,6 +714,11 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 | 14–18 | R4: offline outbox and sync | `tests/pos-r4.test.ts`, `e2e/pos-offline.e2e.ts` |
 | 19–24 | R5: operations (laybys, returns, credit limits, Z-reports, stock counts) | `tests/ops-r5.test.ts` |
 | 25 | R6: fiscal integration adapter (queue-only) | `tests/fiscal-r6.test.ts` |
+| 49–51 | H1: branch server foundation (device, PIN, health) | `tests/branch-h1.test.ts` |
+| 52 | H1: branch till shows cloud-offline and still sells (e2e) | `e2e/branch-offline.e2e.ts` |
+
+H1's tests are numbered 49–51 because R4 already owns 14–18 and R5 owns 19–24; the H1 brief called
+them 16–18. ADR-0026 records the mapping.
 
 Test 13 is the keyboard-only Playwright run and test 14 is the offline reload-and-reconnect run;
 both live in `e2e/`. The e2e config starts its own dev server on port 12100 with its own dist dir

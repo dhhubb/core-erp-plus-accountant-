@@ -209,3 +209,43 @@ mode in this run — whether ZIMRA requires printing at the moment of sale is an
   `enqueueFiscalJob` queues a job; `drainFiscalJobs` / `drainFiscalJobsOn` run a delivery pass;
   `unreachableTransport()` reports `unreachable` without any network call.
 * Endpoints: `GET/PUT /api/fiscal/integration`, `GET /api/fiscal/jobs`, `POST /api/fiscal/drain`.
+
+## H1 extension (Branch server foundation)
+
+Additive, recorded in ADR-0023 to ADR-0027. It does not change core accounting logic; a branch runs
+the same migrations and the same posting functions as the cloud. Everything here is guarded by
+`BRANCH_MODE=branch` (default `cloud`), so the cloud path is unchanged.
+
+* New branch-scoped tables: `device_registrations` (a one-time code that mints a device token; only
+  hashes stored), `cashier_pins` (a bcrypt PIN hash, lockout state, manager flag), `sync_state`
+  (the branch's sync protocol version and push/pull cursors).
+* `app.branch_protocol_version()` — the branch/cloud sync protocol version (constant; bump with the
+  TypeScript constant and an ADR).
+* `app.create_device_registration(org_id, branch_id, till_id, ttl_hours)` — mints a one-time code,
+  stores only its sha256 hash, returns the raw code once.
+* `app.register_device(org_id, branch_id, code, label)` — redeems the code once; stores only the
+  hash of the issued device token, returns the raw token once.
+* `app.authenticate_device(org_id, branch_id, token)` — verifies a device token by hash; rejects a
+  revoked device.
+* `app.hash_secret(secret)` — sha256 hex, the hash used for codes and device tokens.
+* `app.set_cashier_pin(org_id, branch_id, cashier_id, pin, is_manager)` — stores a bcrypt hash.
+* `app.authenticate_cashier(org_id, branch_id, cashier_id, pin)` — verifies a PIN locally; five
+  wrong attempts lock it for 15 minutes. Returns jsonb (`ok`, `locked`, `failed_attempts`,
+  `locked_until`, `is_manager`); never raises for a wrong PIN.
+* `app.manager_override(org_id, branch_id, manager_id, pin)` — true only for a correct manager PIN.
+* `app.branch_sync_state(org_id, branch_id)` — ensures and returns the branch's sync state as jsonb.
+* `app.record_cloud_contact(org_id, branch_id, cloud_version, online)` — stores the branch's
+  observation of the cloud; a version mismatch marks it `incompatible`.
+* TypeScript: `src/branch/` (`config.ts`, `connectivity.ts`, `pin.ts`, `device.ts`, `session.ts`,
+  `health.ts`, `cache.ts`, `useBranchHealth.ts`, `RegisterServiceWorker.tsx`).
+  `isBranchMode()` gates every branch-only path. `probeCloud` compares protocol versions.
+  `signInWithPin` mints a branch access token after a local PIN check.
+* Endpoints: `GET /api/branch/health` (also probed by the cloud; reachable without a token so it
+  answers when auth is broken), `POST /api/branch/login` (local PIN sign-in), `POST /api/branch/devices`
+  (`action: create | register | verify`).
+* PWA: `public/manifest.webmanifest`, `public/sw.js` (never caches `/api/`), `/pos` shows a
+  cloud-status badge polled from the branch (not `navigator.onLine`).
+* `scripts/branch-https.sh` issues a self-signed LAN certificate; `scripts/branch-server.mjs` serves
+  the build over HTTPS when `TLS_CERT_FILE`/`TLS_KEY_FILE` are set. `npm run start:branch`.
+* Redis is cloud-only (ADR-0027): `redisCounterStore()` and `defaultPromoCache()` return in-process
+  stores when `isBranchMode()`.

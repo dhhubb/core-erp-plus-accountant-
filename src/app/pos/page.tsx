@@ -5,6 +5,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiFetch } from '@/verticals/pos/api';
 import { enqueueSale, countPending, type OutboxSale } from '@/verticals/pos/outbox';
 import { syncOnce } from '@/verticals/pos/sync';
+import { RegisterServiceWorker } from '@/branch/RegisterServiceWorker';
+import { useBranchHealth, type BranchHealthState } from '@/branch/useBranchHealth';
 import {
   cartTotals,
   remainingBase,
@@ -67,6 +69,10 @@ export default function PosPage() {
   const [pending, setPending] = useState(0);
   const [syncing, setSyncing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // The branch's connectivity, polled from the branch rather than read from navigator.onLine.
+  // A shop LAN with the internet down shows "cloud offline" even though the browser is "online".
+  const health = useBranchHealth();
 
   const totals = useMemo(() => cartTotals(lines), [lines]);
   const remaining = useMemo(() => remainingBase(lines, tenders, zwgRate), [lines, tenders, zwgRate]);
@@ -455,9 +461,11 @@ export default function PosPage() {
   return (
     <main className="pos" onMouseDown={(event) => event.preventDefault()}>
       <style>{POS_STYLES}</style>
+      <RegisterServiceWorker />
 
       <section className="left">
         <h1>POS</h1>
+        <CloudBadge health={health} />
         <p className="hint">
           Scan (barcode + Enter) · F9 exact cash · F10 exact ZWG cash · Enter confirm &amp; print
         </p>
@@ -545,6 +553,44 @@ export default function PosPage() {
   );
 }
 
+/**
+ * The branch/cloud status badge. Shown always, because a cashier must know whether the cloud is
+ * reachable before they need it. `incompatible` is a warning, not an outage: the branch still sells,
+ * but it will not push until the versions match.
+ */
+function CloudBadge({ health }: { health: BranchHealthState }) {
+  if (!health.branchReachable) {
+    return (
+      <p className="badge badge-down" data-testid="cloud-badge" data-status="branch-down">
+        Branch unreachable — sales queue locally
+      </p>
+    );
+  }
+
+  if (health.cloudStatus === 'online') {
+    return (
+      <p className="badge badge-up" data-testid="cloud-badge" data-status="online">
+        Cloud online
+      </p>
+    );
+  }
+
+  if (health.cloudStatus === 'incompatible') {
+    return (
+      <p className="badge badge-warn" data-testid="cloud-badge" data-status="incompatible">
+        Cloud version mismatch (branch {health.protocolVersion}, cloud {health.cloudProtocolVersion})
+        — sync paused
+      </p>
+    );
+  }
+
+  return (
+    <p className="badge badge-off" data-testid="cloud-badge" data-status="offline">
+      Cloud offline — sales queue locally
+    </p>
+  );
+}
+
 function Receipt({ receipt }: { receipt: PosReceipt }) {
   const taxByRate = new Map<string, Decimal>();
   for (const line of receipt.lines) {
@@ -627,6 +673,12 @@ const POS_STYLES = `
   .tenders { margin-top: 8px; font-size: 14px; }
   .status { margin-top: 10px; display: flex; gap: 16px; font-size: 13px; color: #444; }
   .error { color: #b00; }
+  .badge { display: inline-block; margin: 0 0 8px; padding: 2px 8px; border-radius: 10px;
+           font-size: 12px; font-weight: 600; }
+  .badge-up { background: #e6f4ea; color: #1a7f37; }
+  .badge-off { background: #fdecea; color: #b3261e; }
+  .badge-warn { background: #fff4e5; color: #b26a00; }
+  .badge-down { background: #eee; color: #555; }
   .right { border-left: 1px dashed #bbb; padding-left: 12px; }
   .receipt { width: 58mm; font-size: 12px; }
   .receipt header, .receipt footer { text-align: center; }

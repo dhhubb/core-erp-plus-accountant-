@@ -25,7 +25,8 @@ with tenant_tables as (
       'pos_sync_exceptions',
       'credit_limits', 'laybys', 'layby_reservations', 'returns', 'return_lines',
       'z_reports', 'stock_counts', 'stock_count_items',
-      'fiscal_device_integration', 'fiscal_jobs', 'fiscal_job_attempts'
+      'fiscal_device_integration', 'fiscal_jobs', 'fiscal_job_attempts',
+      'device_registrations', 'cashier_pins', 'sync_state'
     )
 ),
 cols as (

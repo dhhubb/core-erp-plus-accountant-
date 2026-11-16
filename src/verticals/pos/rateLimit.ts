@@ -1,4 +1,6 @@
 import { getRedis } from '@/core/redis';
+import { inProcessIncrWithTtl } from '@/branch/cache';
+import { isBranchMode } from '@/branch/config';
 
 /**
  * Live-sale rate limit: 30 sales per minute per cashier (R4).
@@ -21,6 +23,16 @@ export interface CounterStore {
 }
 
 export function redisCounterStore(): CounterStore {
+  // Redis is cloud-only (decision 13). A branch uses an in-process counter with the same
+  // fixed-window semantics, so a live sale is still rate limited with no Redis on the LAN.
+  if (isBranchMode()) {
+    return {
+      async incrWithTtl(key, ttlSeconds) {
+        return inProcessIncrWithTtl(key, ttlSeconds);
+      },
+    };
+  }
+
   const redis = getRedis();
   return {
     async incrWithTtl(key, ttlSeconds) {

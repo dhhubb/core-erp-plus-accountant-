@@ -471,3 +471,120 @@ with a real timeout, and a decision about what a sale does when the device does 
 the sale, or fall back to `async`). None of that is built now, and nothing in this run should be read
 as a compliance claim. The numbering abstraction (`number_series` + `next_number()`, ADR-0003) and
 the job queue built here are the two places such a run would hook into.
+
+## ADR-0023 — Branch mode is one codebase and one migration set, switched by `BRANCH_MODE`
+
+**Context.** H1 makes a branch able to run on a shop LAN with the internet down. The obvious
+alternative is a separate branch codebase, or a branch-only migration set. Both would drift: the
+branch would slowly diverge from the cloud, and the schema would have two truths.
+
+The brief fixes the deployment shape: a branch runs a custom Next.js server (not Supabase's own
+server), with a local Postgres and a local PIN sign-in, and the cloud keeps Supabase Auth, Realtime
+and Redis.
+
+**Decision.**
+
+1. **One codebase, one build, two modes.** `src/branch/config.ts` reads `BRANCH_MODE` (`cloud` by
+   default; `branch` when explicitly set). Every branch-only behaviour is behind `isBranchMode()`.
+   The cloud behaviour is the default, so an unset variable is never branch mode.
+2. **One migration set.** A branch runs the same `supabase/migrations/` as the cloud. H1 adds only
+   *additive* tables and functions; it edits no applied migration and no core accounting path. The
+   brief is explicit: a vertical (and a branch) may depend on core functions but must never edit core
+   tables without an ADR. The branch-only tables (`device_registrations`, `cashier_pins`,
+   `sync_state`) live in the same public schema, tenant-scoped and RLS-forced like every other.
+3. **The branch serves the build itself.** `scripts/branch-server.mjs` serves the same Next.js build
+   over HTTPS on the LAN when `TLS_CERT_FILE`/`TLS_KEY_FILE` are set, and over HTTP otherwise. The
+   cloud keeps `next start`. `scripts/branch-https.sh` issues the self-signed LAN certificate.
+
+**Consequence.** A cloud change is automatically a branch change, and a schema change is applied
+identically on both sides. The cost is that branch-only code paths must be guarded, which the
+`isBranchMode()` checks make explicit and testable.
+
+## ADR-0024 — A device is registered with a one-time code, and only hashes are stored
+
+**Context.** A till must be able to talk to the branch, and the branch must be able to tell one till
+from another. The brief requires the same care as an invite token: single use, expiring, and stored
+hashed, with no plaintext in the table.
+
+**Decision.**
+
+1. `app.create_device_registration(...)` mints a random code, stores **only its sha256 hash**
+   (`code_hash`) and an expiry (24 hours by default), and returns the raw code once. The raw code is
+   never written to a column.
+2. `app.register_device(...)` redeems the code **once**: it locks the row `FOR UPDATE`, rejects a
+   consumed, expired or unknown code, and on success stores **only the sha256 hash of the issued
+   device token** (`device_token_hash`). The raw token is returned once.
+3. `app.authenticate_device(...)` verifies a token by comparing its hash, and rejects a revoked
+   device. `unique (code_hash)` and `unique (device_token_hash)` make a collision impossible to
+   mistake for a valid redemption.
+4. The pattern mirrors `app.create_invite`/`app.accept_invite` (M1), which the brief points at.
+
+**Consequence.** `tests/branch-h1.test.ts` test 49 asserts that neither the code nor the token
+appears in the table, that both stored values are 64-hex digests, and that a second redemption of the
+same code fails. A database dump cannot be used to impersonate a till.
+
+## ADR-0025 — The branch and the cloud carry a sync protocol version, and a mismatch blocks push
+
+**Context.** The branch and the cloud evolve independently. A branch that pushes an event shape the
+cloud does not understand must not corrupt the cloud, and a cloud that has moved on must not silently
+misread an old branch. The brief makes this decision 17: the branch must refuse to push to a cloud
+whose version it does not understand, and show a warning.
+
+**Decision.**
+
+1. The branch carries a protocol version: `app.branch_protocol_version()` in SQL (a constant) and
+   `BRANCH_PROTOCOL_VERSION` in `src/branch/config.ts`. The two must be bumped together, in a
+   migration, with an ADR.
+2. `probeCloud` (in `src/branch/connectivity.ts`) compares the cloud's reported version to the
+   branch's. A reachable cloud on a different version yields `incompatible`; a reachable cloud on the
+   same version yields `online`; anything unreachable yields `offline`.
+3. The branch stores its observation in `public.sync_state` (`cloud_status`,
+   `cloud_protocol_version`, `last_cloud_contact_at`), so a health read does not have to reach the
+   cloud. An `incompatible` status sets `push_blocked`, and the till shows a version-mismatch warning
+   while still selling locally.
+4. The cloud is master: the branch is the one that must be upgraded.
+
+**Consequence.** A version skew is visible on the till and stops the push, rather than corrupting the
+cloud. `tests/branch-h1.test.ts` test 51 covers `online`, `offline` and `incompatible`.
+
+## ADR-0026 — H1 test numbering continues from 48, and the H1 spec's 16–18 map to 49–51
+
+**Context.** The H1 brief numbers its tests 16, 17 and 18. Those numbers are already taken: R4 owns
+tests 14–18 and R5 owns 19–24. ADR-0010 already fixed the rule: a new run continues from the highest
+number actually present, not from a range reserved elsewhere.
+
+**Decision.** H1 owns **49, 50 and 51** in `tests/branch-h1.test.ts`, plus supporting tests in the
+same file and `tests/branch-https.test.ts`. The mapping is:
+
+| H1 spec | Canonical | Test |
+| --- | --- | --- |
+| 16 | 49 | A device is registered with a one-time code; only hashes are stored, single use |
+| 17 | 50 | A cashier signs in with a local PIN; five wrong PINs lock it; manager override |
+| 18 | 51 | Branch health reports the cloud offline when unreachable; the branch keeps selling |
+| — | 52 | e2e: the branch till shows cloud-offline and still sells on the LAN (`e2e/branch-offline.e2e.ts`) |
+
+**Consequence.** No number is reused and no test is dropped. The H1 spec's numbers are recorded here
+so a reader following the brief can find the right test.
+
+## ADR-0027 — Redis is cloud-only; a branch uses in-process caches and the local database
+
+**Context.** The brief makes decision 13: a branch has no Redis. Redis in this codebase is never a
+source of truth; it holds a promotion *candidate* cache (R2) and a live-sale *rate-limit counter*
+(R4). Both must keep working on a branch with no Redis.
+
+**Decision.**
+
+1. `src/branch/cache.ts` provides an in-process, TTL-aware map with the same fixed-window semantics
+   as the Redis counter (`INCR` + `EXPIRE`, TTL set only when the window opens) and a `PromoCache`
+   stand-in.
+2. `redisCounterStore()` (R4) returns the in-process store when `isBranchMode()`, and the Redis store
+   otherwise. The cloud path is byte-for-byte unchanged.
+3. `defaultPromoCache()` (R2) returns the in-process cache when `isBranchMode()`, and the Redis cache
+   otherwise. The promotion validity window is still re-checked in SQL at evaluation time on both
+   sides, so an in-process entry cannot apply an expired promotion.
+4. Nothing else in the branch reads Redis. The branch's durable state is its local Postgres, which
+   carries the same immutable ledger.
+
+**Consequence.** A branch needs only its own Postgres. The caches rebuild from the database on a
+miss, so a restart loses nothing that matters. `tests/branch-h1.test.ts` covers the counter's window
+semantics.
