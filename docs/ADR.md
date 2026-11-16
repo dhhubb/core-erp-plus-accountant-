@@ -1081,3 +1081,78 @@ run as the caller, so RLS scopes every row, and a branch a token does not scope 
 
 **Consequence.** The branch and the cloud show the same figure from the same code; the console states
 when the branch last synced; and no second reporting path exists to drift from the first.
+
+## ADR-0050 — A1 owns tests 96–104, and the admin writes live in SQL
+
+**Context.** The core owns tests 1–40 and forbids renumbering. H6 owns 86–95. ADR-0010 fixes the
+rule: a new run continues from the highest number actually present. A1 is the admin products UI — a
+new run.
+
+**Decision.** A1 owns **96–104** in `tests/admin-a1.test.ts`. The mapping is:
+
+| A1 requirement | Canonical | Test |
+| --- | --- | --- |
+| Category tree nests through `parent_id`; delete guards | 96 | 96 |
+| New product takes a gapless SKU; master-data change recorded | 97 | 97 |
+| Weighable unit rule | 98 | 98 |
+| EAN-13 check digit and per-org barcode uniqueness | 99 | 99 |
+| Batch belongs to a variant; days to expiry | 100 | 100 |
+| Keyset pagination of the product list | 101 | 101 |
+| Route refuses `limit > 100` and a cross-org body | 102 | 102 |
+| Offline edit outbox and backoff | 103 | 103 |
+| USB-wedge scanner detection | 104 | 104 |
+
+The business logic lives in SQL functions under `app` (`app.create_product`, `app.create_variant`,
+`app.admin_list_products`, …), called from thin route handlers. Every function is **SECURITY
+INVOKER**, so RLS scopes the rows the caller may touch and no admin path runs as the service role.
+A product or variant write also appends a master-data change (`app.record_master_data_change`), so a
+branch pulls the new catalogue on its next sync (H2).
+
+**Consequence.** The admin UI is a thin client over SQL, consistent with CORE_INTERFACE, and its
+writes are RLS-scoped and synced to branches for free.
+
+## ADR-0051 — EAN-13 is validated in the application, not by a table CHECK
+
+**Context.** A barcode may be a real EAN-13 (13 digits with a check digit) or an internal code. R1
+and the H5 import wizard already store barcodes that are not EAN-13: the R1 tests use `111222333`
+(9 digits) and `5901234123457`, and the sample files use 13-digit codes. A table `CHECK` that
+demanded a valid EAN-13 on every barcode would reject the R1 and H5 data, and a `CHECK` cannot run
+the weighted-sum arithmetic cleanly for a nullable, sometimes-non-numeric column.
+
+**Decision.** Validation is application-level, in two mirrored places: `app.is_valid_ean13(text)`
+(and `app.assert_barcode`) in SQL, and `isValidEan13` in `src/verticals/admin/barcode.ts`. A
+barcode that is **exactly 13 digits** must carry a valid EAN-13 check digit; anything else (a short
+internal code, a 12-digit UPC, an alphanumeric code) is accepted as-is. Per-org uniqueness stays a
+database constraint — the existing partial unique index `(org_id, barcode) WHERE barcode IS NOT
+NULL`.
+
+**Consequence.** A real EAN-13 is honest and a scan typo is caught at entry, while the R1 and H5
+data stays valid and per-org uniqueness remains a database guarantee.
+
+## ADR-0052 — An admin edit made offline is queued in IndexedDB, like a sale
+
+**Context.** A branch admin may work when the cloud is unreachable. Losing a product edit is
+unacceptable, and the POS already solved the same problem with an IndexedDB outbox (ADR-0015).
+
+**Decision.** The admin reuses the pattern: a write that fails with a network error (not an HTTP
+error) is written to an IndexedDB store (`erp-admin-outbox`) with its method, path, JSON body and
+backoff bookkeeping, and replayed when the connection returns. An HTTP error (a 403, a 422 from a
+constraint) is surfaced to the user, never queued, because replaying it would fail the same way.
+
+**Consequence.** An offline branch admin does not lose a catalogue edit, and the admin outbox is
+separate from the till's, so a backlog of catalogue edits never competes with a backlog of sales.
+
+## ADR-0053 — The admin variant cost is a nullable planning figure, not the ledger cost
+
+**Context.** The admin variant screen shows a cost per variant. The ledger's cost of goods is the
+FIFO cost on the immutable stock layers, and it is not a single number per variant — it varies by
+layer and by warehouse. Storing a "cost" on the variant risks a reader mistaking it for the ledger
+cost.
+
+**Decision.** `product_variants.cost` is a nullable `NUMERIC(19,4)` planning figure (a purchase or
+list cost for the admin). It is documented as **not** the ledger FIFO cost, and no posting function
+reads it: `app.create_invoice` and the FIFO consumers continue to read the immutable layers. The
+column is nullable, so every existing row and every H5 import stays valid.
+
+**Consequence.** The admin has a cost to show and to plan with, the ledger cost stays the single
+source of truth for accounting, and the two can never be confused in a posting path.

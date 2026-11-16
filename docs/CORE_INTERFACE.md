@@ -402,3 +402,41 @@ signature; it now also writes the shift's daily facts in the same transaction.
   (403).
 * Page `/reports` — the owner console and the branch view in one (period picker, tabs, figures, a
   last-synced label).
+
+## A1 extension (Admin products UI)
+
+Additive, recorded in ADR-0050 to ADR-0053. It adds one nullable column to a core-adjacent table
+(`product_variants.cost`, ADR-0053) and no core function signature changes. Every new function is
+**SECURITY INVOKER**, so the caller's RLS scopes the rows; no admin path uses the service role.
+
+* `app.is_valid_ean13(text) -> boolean` and `app.assert_barcode(text)` — the EAN-13 check digit,
+  applied only to a 13-digit code (ADR-0051).
+* `app.assert_page_limit(int)` — reused from the core; the admin list functions call it so the SQL
+  guards the 1..100 limit as well as the route.
+* `app.record_master_data_change(...)` — reused from H2; a product or variant write calls it so a
+  branch pulls the change on its next sync.
+* Categories: `app.create_category(org_id, name, slug, parent_id) -> uuid`,
+  `app.update_category(...)`, `app.delete_category(org_id, id)` (refuses a child or a product in
+  use), `app.admin_category_tree(org_id)` (recursive, depth-first ordered, with `depth` and `path`).
+* Products: `app.create_product(org_id, name, category_id, unit, is_weighable, sku) -> uuid`,
+  `app.update_product(...)`, `app.delete_product(org_id, id)`,
+  `app.admin_list_products(org_id, limit, after_created_at, after_id, category_id, is_weighable,
+  query)` — a keyset page; a category filter includes its descendants.
+* Variants: `app.create_variant(org_id, product_id, name, size, color, barcode, cost, sku) -> uuid`,
+  `app.update_variant(...)`, `app.delete_variant(...)`,
+  `app.admin_list_variants(org_id, product_id, limit, after_created_at, after_id)` — a keyset page
+  with `qty_on_hand`.
+* Batches: `app.create_batch(org_id, variant_id, batch_no, expiry_date) -> uuid`,
+  `app.update_batch(...)`, `app.delete_batch(...)`,
+  `app.admin_list_batches(org_id, product_id, limit, after_created_at, after_id)` — a keyset page
+  with `days_to_expiry`.
+* TypeScript (`src/verticals/admin/`): `types.ts`, `barcode.ts` (`isValidEan13`, `ean13CheckDigit`,
+  `normaliseBarcode`), `catalogue.ts` (`listProducts`, `listVariants`, `listBatches`,
+  `categoryTree`, `createCategory`, …), `scanner.ts` (`WedgeDetector`), `expiry.ts` (`expiryTone`,
+  `daysToExpiry`), `outbox.ts` (the IndexedDB edit outbox, ADR-0052), `client.ts` (browser fetch),
+  `filters.ts` (Zustand filter store).
+* Components: `BarcodeScannerInput.tsx`, `WeighableToggle.tsx`.
+* Endpoints: `GET`/`POST /api/admin/categories`, `PATCH`/`DELETE /api/admin/categories/[id]`, and the
+  same shape for `products`, `variants` and `batches`. A limit above 100 is refused (422); a body
+  naming another org is refused (403); a duplicate (23505) or a bad argument (22023) is a 422.
+* Pages: `/admin/categories`, `/admin/products`, `/admin/products/[id]/variants`, `/admin/batches`.

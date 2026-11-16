@@ -28,6 +28,8 @@ pricing and promotions: tests 45–48.
 | H3 | Fiscal and numbering: FDMS queue, branch-local number blocks | tests 64–68 | DONE |
 | H4 | Hardware and receipts: ESC/POS, QR, printer settings, relay, scanner, hold/recall, print timing | tests 69–74 | DONE |
 | H5 | Migration wizard: Pastel CSV → products/customers/opening stock, chunked COPY, mapping, commit | tests 75–85 | DONE |
+| H6 | Reports and the owner console: profit, VAT, Z-reports; branch + cloud | tests 86–95 | DONE |
+| A1 | Admin products UI: categories, products, variants, barcodes, batches (cloud + branch admin) | tests 96–104 | DONE |
 
 ## M0 — Setup
 
@@ -1278,3 +1280,90 @@ $ scripts/check-tenant-tables.sql
   statistics; it passes on a fresh `supabase db reset` and in the full suite. No test was weakened.
 * No test is mocked: the reports are driven against the real local Postgres, through the SQL
   functions and through the route handlers with a real access token.
+
+## A1 — Admin products UI (categories, products, variants, barcodes, batches)
+
+The owner manages the catalogue from the cloud **and** from a branch admin: a category tree, products
+with variants, barcodes, and product batches. The business logic lives in SQL functions under `app`,
+called from thin route handlers (ADR-0050); the pages are thin clients over `/api/admin/*`.
+
+### What was built
+
+* **Migration** `supabase/migrations/20260101130000_admin_a1.sql`:
+  * `app.is_valid_ean13(text)` and `app.assert_barcode(text)` — EAN-13 check digit, applied only to a
+    13-digit code (ADR-0051). the shared `1..100` limit rule (`app.assert_page_limit`) is reused.
+  * Catalogue functions, all **SECURITY INVOKER** (RLS applies): `app.create_category`,
+    `app.update_category`, `app.delete_category` (guards a child or a product in use),
+    `app.admin_category_tree` (recursive, ordered), `app.create_product`, `app.update_product`,
+    `app.delete_product`, `app.admin_list_products` (keyset, recursive descendant filter),
+    `app.create_variant`, `app.update_variant`, `app.delete_variant`, `app.admin_list_variants`,
+    `app.create_batch`, `app.update_batch`, `app.delete_batch`, `app.admin_list_batches` (with
+    `days_to_expiry`).
+  * `app.record_master_data_change` — a product or variant write appends a `master_data_changes`
+    row so a branch pulls the new catalogue on its next sync (H2).
+  * `product_variants.cost NUMERIC(19,4)` added (nullable planning cost, ADR-0053).
+* **Domain modules** `src/verticals/admin/`: `types.ts`, `barcode.ts` (EAN-13 in TypeScript),
+  `catalogue.ts` (server-side data access, keyset), `scanner.ts` (USB-wedge detector), `expiry.ts`
+  (days to expiry / colour tone), `outbox.ts` (IndexedDB outbox, ADR-0052), `client.ts` (browser
+  fetch client), `filters.ts` (Zustand filter store).
+* **Components**: `BarcodeScannerInput.tsx` (wedge scan into a field), `WeighableToggle.tsx`.
+* **Routes** `src/app/api/admin/`: categories, products, variants, batches (list, create, update,
+  delete), with a shared `_shared.ts` (`requireOrg`, `assertSameOrg`, `withWriteErrors`).
+* **Pages**: `/admin/categories` (tree), `/admin/products` (list + create, keyset "Load more"),
+  `/admin/products/[id]/variants`, `/admin/batches` (expiry colouring).
+
+### The A1 tests (`tests/admin-a1.test.ts`)
+
+| # | Test |
+| --- | --- |
+| 96 | The category tree nests through `parent_id`; a delete is refused while a child or a product remains |
+| 97 | A new product takes a gapless SKU from the number series and records a master-data change |
+| 98 | A weighable product must use a measure unit; `each` is refused by the route and by the SQL check |
+| 99 | A 13-digit barcode must carry a valid EAN-13 check digit; a duplicate barcode is refused |
+| 100 | A batch belongs to a variant and reports its days to expiry |
+| 101 | The admin product list pages by keyset and returns every product exactly once |
+| 102 | The admin routes refuse `limit > 100` and a body naming another org |
+| 103 | An offline edit is queued in the IndexedDB outbox and backs off after a failure |
+| 104 | The barcode wedge detector tells a fast scan from slow typing |
+
+### Gate evidence (A1)
+
+```
+$ npx supabase db reset
+Applying migration 20260101130000_admin_a1.sql...
+Finished supabase db reset on branch master.
+
+$ npm test
+ Test Files  21 passed (21)
+      Tests  165 passed (165)
+
+$ npm run build
+✓ Compiled successfully   (/admin/categories, /admin/products,
+                           /admin/products/[id]/variants, /admin/batches,
+                           /api/admin/*)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+### Notes
+
+* **RLS on every admin path.** Each `app.admin_*` / `app.create_*` function is SECURITY INVOKER, so
+  the caller's JWT scopes the rows. The route never uses the service role. A body naming another
+  org is refused with 403, and the SQL function refuses the same write under RLS (test 102).
+* **A duplicate is a client error.** `withWriteErrors` maps SQLSTATE `23505` (unique) and `22023`
+  (a bad argument, e.g. a bad EAN-13 check digit) to a 422, so a duplicate barcode or a scan typo is
+  reported honestly, not as a 500.
+* **EAN-13 only for 13 digits.** The check-digit rule applies to a 13-digit code; a short internal
+  code (R1's `111222333`) stays valid, so the R1 and H5 data is untouched (ADR-0051).
+* **Cost is a planning figure.** `product_variants.cost` is nullable and is not read by any posting
+  function; the ledger cost stays the FIFO layer cost (ADR-0053).
+* No test is mocked: the admin tests run against the real local Postgres and call the route handlers
+  with a real access token. The outbox test uses `fake-indexeddb`, an in-memory implementation of
+  the browser's own IndexedDB interface.

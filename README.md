@@ -922,6 +922,33 @@ high-volume branch index, a per-product index and the FK indexes, is immutable
 `(org_id, branch_id, shift_id, business_date, product_id, variant_id)` makes the shift-close write
 idempotent.
 
+## The admin console (catalogue management)
+
+The owner manages the catalogue from the cloud **and** from a branch admin. The pages are thin
+clients over `/api/admin/*`; the business logic lives in SQL functions under `app`, so RLS scopes
+every row and a branch pulls the change on its next sync (ADR-0050).
+
+| Page | Purpose |
+| --- | --- |
+| `/admin/categories` | The category tree (`parent_id` nesting), create / rename / delete |
+| `/admin/products` | The product list (keyset, "Load more") and the create form |
+| `/admin/products/[id]/variants` | A product's variants: size, colour, barcode, planning cost |
+| `/admin/batches` | Product batches with an expiry countdown (amber ≤ 30 days, red when expired) |
+
+**Endpoints.** `GET`/`POST /api/admin/categories`, `PATCH`/`DELETE /api/admin/categories/[id]`, and
+the same shape for `products`, `variants` and `batches`. A list is a keyset page on
+`(created_at, id)` (default 50, maximum 100); the SQL guards the limit too. A write that names
+another org is refused with 403, and a duplicate (SQLSTATE 23505) or a bad argument (22023) is a 422.
+
+**Barcodes.** A 13-digit barcode must carry a valid EAN-13 check digit, checked in SQL
+(`app.is_valid_ean13`) and mirrored in TypeScript (`src/verticals/admin/barcode.ts`). Anything else
+(a short internal code, a 12-digit UPC) is accepted as-is, so the R1 and H5 data stays valid
+(ADR-0051). Per-org uniqueness is the existing partial unique index on `(org_id, barcode)`.
+
+**Offline.** A branch admin's edit that cannot reach the server is queued in an IndexedDB outbox
+(`src/verticals/admin/outbox.ts`) and replayed with a capped backoff, like a till sale but in its own
+store (ADR-0052).
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
