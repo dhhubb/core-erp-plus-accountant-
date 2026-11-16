@@ -929,7 +929,7 @@ connection (`app.branch_mode=branch`), with the in-memory FDMS device:
 
 ```
 $ supabase db reset
-Finished supabase db reset on branch master.   (all 17 migrations applied)
+Finished supabase db reset on branch master.   (all 20 migrations applied)
 
 $ npm test
  Test Files  14 passed (14)
