@@ -713,6 +713,70 @@ BRANCH_MODE=branch BRANCH_ORG_ID=<org> BRANCH_ID=<branch> \
 `sync_conflicts`, `sync_backups`. Org-scoped: `master_data_changes`. All carry `org_id`, `created_at`,
 forced RLS and the standard indexes, and are registered in `scripts/check-tenant-tables.sql`.
 
+## Fiscal and numbering (H3)
+
+H3 makes a fiscal invoice submit reliably after an outage and makes invoice numbers impossible to
+collide or reuse. Nothing here blocks a sale on FDMS or the cloud. See ADR-0035 to ADR-0038.
+
+**The queue (branch only).** A sale's invoice writes one `public.fiscal_invoices` row in the invoice's
+OWN transaction, in the same `app.create_invoice` / `app.pos_sale_receipt` call that posts the
+journal. The row starts `pending`. The enqueue is gated by `app.branch_mode_enabled()`, so the
+cloud's replayed invoices never queue fiscal rows and the cloud never talks to FDMS (ADR-0035). A
+rollback of the sale rolls back the fiscal row with it.
+
+**Status and attempts.** `status` is `pending`, `sent` or `failed`. A submission has three outcomes
+(ADR-0037):
+
+* `sent` — the device accepted the invoice; its signature and QR are stored on the row and shown on
+  the receipt.
+* `failed` — a real FDMS rejection. `attempts` increases and the next attempt is scheduled with
+  exponential backoff. At 5 rejections the row moves to `failed` and stops being retried.
+* `unreachable` — a network outage. The row stays `pending` and `attempts` is NOT touched, so an
+  outage never burns the retry budget.
+
+Every real submission appends a row to `public.fiscal_invoice_attempts` (append-only; UPDATE and
+DELETE are rejected).
+
+**The worker (a loop, not a cron).** `npm run branch:fiscal` runs `startFiscalLoop`, a long-lived
+worker that drains the branch's due rows continuously (default every 5s). Each pass claims with
+`FOR UPDATE SKIP LOCKED` and holds the row lock until the outcome is recorded, so two workers running
+at once never submit the same invoice twice (test 68). A pass that throws does not stop the loop.
+
+```bash
+BRANCH_MODE=branch BRANCH_ORG_ID=<org> BRANCH_ID=<branch> \
+  FDMS_ENDPOINT=https://fdms.example FDMS_DEVICE_SERIAL=<serial> npm run branch:fiscal
+```
+
+With no FDMS credentials the loop uses a mock device (`FDMS_MOCK=outage` or `FDMS_MOCK=reject:<n>`
+select the outage and rejection paths).
+
+**Invoice number blocks.** The cloud issues each branch a contiguous range of invoice numbers
+(`app.issue_number_block`, carved from `number_series` under `FOR UPDATE`, so two branches can never
+be issued the same number). The branch stores the block in `public.number_blocks` and
+`app.claim_invoice_number` takes the next number from its oldest block that still has numbers — so
+topping up early never leaves a gap. The branch asks for the next block BEFORE the current one runs
+out (`ensureNextBlock`, low-water mark 20); a failed fetch is a no-op, so an offline branch keeps
+selling from what it has. When a branch's blocks are truly exhausted, a sale fails with the clear,
+catchable error `invoice number block exhausted...` and no number is reused (test 67). A branch that
+has never been issued a block falls back to the org's gapless series, so the cloud path is unchanged
+(ADR-0036).
+
+```bash
+# Cloud: reserve a block for a branch (a branch member's token; org comes from the token)
+curl -X POST https://cloud.example/api/branch/numbers/claim \
+  -H "Authorization: Bearer <token>" -H 'Content-Type: application/json' \
+  -d '{"branch_id": "<branch>", "series_code": "INVOICE", "size": 200}'
+```
+
+**Admin.** `/settings/fiscal` lists the branch's queue with counts by status and offers a retry for
+failed rows and a manual submit for pending or failed rows
+(`GET /api/fiscal/invoices`, `POST /api/fiscal/invoices/:id/retry`,
+`POST /api/fiscal/invoices/:id/send`, `GET/POST /api/fiscal/numbers`).
+
+**The fiscal tables.** Branch-scoped: `fiscal_invoices`, `fiscal_invoice_attempts`, `number_blocks`.
+All carry `org_id`, `created_at`, forced RLS and the standard indexes, and are registered in
+`scripts/check-tenant-tables.sql`.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -776,9 +840,11 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 | 49–51 | H1: branch server foundation (device, PIN, health) | `tests/branch-h1.test.ts` |
 | 52 | H1: branch till shows cloud-offline and still sells (e2e) | `e2e/branch-offline.e2e.ts` |
 | 53–63 | H2: offline sync engine (outbox, push, pull, retry, backup) | `tests/sync-h2.test.ts` |
+| 64–68 | H3: fiscal and numbering (queue, outage, blocks, exactly-once) | `tests/fiscal-h3.test.ts` |
 
 H1's tests are numbered 49–51 because R4 already owns 14–18 and R5 owns 19–24; the H1 brief called
-them 16–18. H2 continues from 52 (ADR-0033). ADR-0026 and ADR-0033 record the mappings.
+them 16–18. H2 continues from 52 (ADR-0033) and H3 from 63 (ADR-0038). ADR-0026, ADR-0033 and
+ADR-0038 record the mappings.
 
 Test 13 is the keyboard-only Playwright run and test 14 is the offline reload-and-reconnect run;
 both live in `e2e/`. The e2e config starts its own dev server on port 12100 with its own dist dir

@@ -249,3 +249,44 @@ the same migrations and the same posting functions as the cloud. Everything here
   the build over HTTPS when `TLS_CERT_FILE`/`TLS_KEY_FILE` are set. `npm run start:branch`.
 * Redis is cloud-only (ADR-0027): `redisCounterStore()` and `defaultPromoCache()` return in-process
   stores when `isBranchMode()`.
+
+## H3 extension (Fiscal and numbering)
+
+Additive, recorded in ADR-0035 to ADR-0038. It does not change core accounting logic; a branch runs
+the same migrations and the same posting functions as the cloud. The fiscal enqueue is guarded by
+`app.branch_mode_enabled()` (default off), so the cloud path is unchanged.
+
+* New branch-scoped tables: `fiscal_invoices` (the FDMS submission queue; one pending row per
+  invoice, unique per `(org_id, invoice_id)`; `status` `pending` | `sent` | `failed`; `fdms_payload`,
+  `fdms_response`, `attempts`, `next_attempt_at`, `last_error`), `fiscal_invoice_attempts`
+  (APPEND-ONLY delivery attempts; `outcome` `sent` | `failed` | `unreachable`), `number_blocks`
+  (cloud-issued contiguous invoice-number ranges; unique per `(org_id, branch_id, series_code,
+  block_no)`).
+* `app.fiscal_invoice_enqueue(org_id, branch_id, invoice_id)` — inserts exactly one pending fiscal
+  row in the caller's transaction, and nothing unless `app.branch_mode` is on. Idempotent per
+  `(org_id, invoice_id)`. Called by `app.create_invoice` and `app.pos_sale_receipt`.
+* `app.fiscal_claim_pending(org_id, branch_id, limit)` — the pending rows due now, oldest first,
+  `FOR UPDATE SKIP LOCKED`. The caller holds the transaction so the lock covers the submission.
+* `app.fiscal_invoice_attempt(org_id, branch_id, id, outcome, response, error)` — records one real
+  submission. `sent` marks the row sent with its response; `failed` increments `attempts` and sets
+  the backoff, moving to `failed` at 5; `unreachable` leaves the row pending and does NOT touch
+  `attempts`. Appends a `fiscal_invoice_attempts` row for every call.
+* `app.fiscal_invoice_queue(...)`, `app.fiscal_invoice_summary(...)`,
+  `app.fiscal_invoice_retry(...)`, `app.fiscal_invoice_manual_send(...)` — the admin reads and
+  actions (keyset page, counts by status, re-arm a failed row, submit a row now).
+* Number blocks: `app.issue_number_block(org_id, branch_id, series_code, size)` (CLOUD; carves a
+  range from `number_series` under `FOR UPDATE`), `app.store_number_block(...)` (branch; idempotent),
+  `app.number_block_active(...)`, `app.number_block_status(...)`, and `app.claim_invoice_number(...)`
+  (the next number from the branch's oldest block with numbers; raises `'invoice number block
+  exhausted...'` when none is left). `app.next_number` for the `INVOICE` series routes to
+  `app.claim_invoice_number`; a branch with no block falls back to the org series.
+* TypeScript: `src/fiscal/fdms.ts` (`FdmsClient`, `MockFdmsClient`, `httpFdmsClient`, `fdmsCredentials`),
+  `src/fiscal/queue.ts` (`listFiscalQueue`, `fiscalSummary`, `retryFiscalInvoice`,
+  `manualSendFiscalInvoice`, `claimPendingFiscalInvoices`, `recordFiscalOutcome`, `runFiscalPassOn`),
+  `src/fiscal/invoiceWorker.ts` (`runFiscalPass`, `startFiscalLoop`),
+  `src/fiscal/numberBlocks.ts` (`numberBlockStatus`, `issueNumberBlock`, `storeNumberBlock`,
+  `cloudBlockFetcher`, `ensureNextBlock`).
+* Endpoints: `GET /api/fiscal/invoices`, `POST /api/fiscal/invoices/:id/retry`,
+  `POST /api/fiscal/invoices/:id/send`, `GET/POST /api/fiscal/numbers`,
+  `POST /api/branch/numbers/claim` (cloud). Page `/settings/fiscal`.
+* Loop: `npm run branch:fiscal` (`scripts/branch-fiscal-loop.ts`).

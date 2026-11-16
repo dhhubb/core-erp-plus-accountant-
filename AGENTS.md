@@ -140,6 +140,23 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
   the branch's stored observation of the cloud; `navigator.onLine` is wrong on a LAN with the
   internet down. `?probe=1` refreshes the observation with a short timeout (never hangs). A version
   mismatch is `incompatible` and sets `push_blocked` (ADR-0025).
+* **Fiscal submission is a branch queue, never on the sale path.** A sale's invoice writes one
+  `fiscal_invoices` row in the invoice's own transaction (`app.fiscal_invoice_enqueue`, gated by
+  `app.branch_mode_enabled()`), so the cloud's replayed invoices never queue fiscal rows and the
+  cloud never talks to FDMS (ADR-0035). `npm run branch:fiscal` runs the worker LOOP (default 5s);
+  each pass claims with `FOR UPDATE SKIP LOCKED` and holds the lock until the outcome is recorded,
+  so two workers never submit the same invoice twice.
+* **A network outage is not a rejection.** `app.fiscal_invoice_attempt` leaves the row `pending` and
+  does NOT touch `attempts` on an `unreachable` outcome; only a real `failed` outcome increments the
+  attempt count and schedules backoff, moving the row to `failed` at 5 (ADR-0037). The FDMS device is
+  an interface (`src/fiscal/fdms.ts`); the gate uses `MockFdmsClient` (a real device object with an
+  outage switch and a rejection counter), never a database mock.
+* **Invoice numbers come from cloud-issued branch-local blocks.** `app.issue_number_block` carves a
+  contiguous range from `number_series` under `FOR UPDATE` (two branches can never get the same
+  number); `app.claim_invoice_number` takes the next number from the branch's oldest block with
+  numbers, so topping up early never leaves a gap, and raises a clear `'invoice number block
+  exhausted...'` error when none is left (ADR-0036). A branch with no block falls back to the org
+  series. The branch tops up at a low-water mark (`ensureNextBlock`); an offline fetch is a no-op.
 * **Redis is cloud-only.** The live-sale rate limiter and the promotion cache fall back to
   in-process stores in branch mode (`src/branch/cache.ts`); the promotion validity window is still
   re-checked in SQL, so a stale entry cannot apply an expired promotion (ADR-0027).
@@ -151,6 +168,7 @@ Phase 1 owns 1–40. R1 owns 41–44 (`tests/retail-r1.test.ts`). R2 owns 45–4
 14–18 (`tests/pos-r4.test.ts` plus the offline e2e). R5 owns 19–24 (`tests/ops-r5.test.ts`). R6
 owns 25 (`tests/fiscal-r6.test.ts`). H1 owns 49–51 (`tests/branch-h1.test.ts`) and 52
 (`e2e/branch-offline.e2e.ts`); the H1 brief called them 16–18, but those are taken — ADR-0026 maps
-them. A new
+them. H2 owns 53–63 (`tests/sync-h2.test.ts`, ADR-0033). H3 owns 64–68
+(`tests/fiscal-h3.test.ts`, ADR-0038). A new
 run continues from the highest number actually present; ranges in `docs/phase2/README.md` are
 indicative only (ADR-0010).

@@ -26,6 +26,7 @@ with tenant_tables as (
       'credit_limits', 'laybys', 'layby_reservations', 'returns', 'return_lines',
       'z_reports', 'stock_counts', 'stock_count_items',
       'fiscal_device_integration', 'fiscal_jobs', 'fiscal_job_attempts',
+      'fiscal_invoices', 'fiscal_invoice_attempts', 'number_blocks',
       'device_registrations', 'cashier_pins', 'sync_state',
       'sync_outbox', 'sync_inbox', 'master_data_changes', 'branch_master_data',
       'sync_conflicts', 'sync_backups'

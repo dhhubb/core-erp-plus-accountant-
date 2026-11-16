@@ -752,3 +752,88 @@ Two deliberate limits in this phase:
 
 **Consequence.** Pushing is safe to retry and never double-posts. Tests 54, 56 and 62 pin the
 idempotency.
+
+## ADR-0035 — Fiscal submission is branch-only; the cloud's write path stays free of fiscal rows
+
+**Context.** H3 adds a fiscal invoice queue (`fiscal_invoices`) that must submit reliably after
+outages. The branch is the system of record for the sales it rings (ADR-0023) and the FDMS device
+lives at the branch. The cloud replays a branch's events into its own ledger (ADR-0034), so a naive
+"enqueue on every invoice" would also queue fiscal rows on the cloud — for invoices the cloud never
+sells at a till and has no device to submit.
+
+**Decision.** The fiscal enqueue is gated by `app.branch_mode_enabled()`, exactly like the H2 outbox
+triggers. `app.create_invoice` and `app.pos_sale_receipt` call `app.fiscal_invoice_enqueue` in the
+invoice's own transaction, but the enqueue is a no-op unless `app.branch_mode` is on. The cloud's
+replayed invoices therefore never queue fiscal rows, and the cloud never talks to FDMS.
+
+**Consequence.** The cloud and branch share one `fiscal_invoices` table and one set of functions; the
+GUC decides who queues. A cloud test that does not set `app.branch_mode=branch` sees no fiscal rows
+(that is what test 60 in the H2 suite already asserts for the outbox, and it stays true for fiscal).
+Tests that exercise the branch set the GUC on their connection.
+
+## ADR-0036 — Invoice numbering uses cloud-issued, branch-local number blocks; exhaustion is a catchable error
+
+**Context.** The core already draws gapless invoice numbers from `number_series` with a
+`SELECT ... FOR UPDATE` (ADR-0004). That is correct on the cloud, where every request can reach the
+series row. A branch that keeps selling while offline cannot lock the cloud's row, so it needs a
+range of numbers it owns locally — but those ranges must never overlap another branch's, and a
+number must never be reused.
+
+**Decision.** The cloud issues **blocks**: `app.issue_number_block` carves a contiguous range from
+the org's `number_series` row under a `FOR UPDATE` lock (`block_no = last_block_no + 1`,
+`first_value = next_value`, `last_value = next_value + size - 1`) and advances the series past the
+block. The branch stores the block in `public.number_blocks` (`app.store_number_block`, idempotent on
+`(org_id, branch_id, series_code, block_no)`). `app.claim_invoice_number` takes the next number from
+the branch's **oldest** block that still has numbers, so topping up early never leaves a gap; it
+raises `'invoice number block exhausted...'` when no block has a number left. `app.next_number` for
+the `INVOICE` series is redirected to `app.claim_invoice_number`, so `app.create_invoice` is
+unchanged in shape. A branch that has never been issued a block falls back to the org series
+(no behaviour change for the cloud or the existing core tests).
+
+The branch asks for the next block **before** the current one runs out: `ensureNextBlock` fetches a
+block when the remaining count reaches the low-water mark, and a failed fetch is a no-op, so an
+offline branch keeps selling from what it has.
+
+**Consequence.** Two branches can never be issued the same number (the cloud lock serialises block
+issuance), a number is never reused (numbers only advance), and an offline branch fails a sale with
+a clear, catchable error only when it has truly run out. Test 67 pins the top-up and the exhaustion
+error; test 39 (100 concurrent invoices, gapless) still passes because the fallback path is
+unchanged when no block exists.
+
+## ADR-0037 — The FDMS client is an interface; a mock with real state exercises the outage paths
+
+**Context.** H3 must show that fiscal invoices submit reliably after outages and that a real
+rejection is handled differently from a network outage. Real ZIMRA integration (the exact wire
+format, the device certificate flow) is an open item (ADR-0003), and the gate must run with no
+network.
+
+**Decision.** `src/fiscal/fdms.ts` defines `FdmsClient` with three outcomes: `sent` (accepted, with
+a signature and QR), `failed` (a real FDMS rejection — counts against the 5-attempt budget), and
+`unreachable` (a network outage — the row stays pending and the attempt count is untouched). Two
+implementations: `MockFdmsClient` (a real object with real state — an outage switch, a rejection
+counter, and a record of every invoice it accepted) and `httpFdmsClient` (POSTs to the configured
+endpoint; a transport error is `unreachable`, a non-2xx is `failed`). The gate uses the mock; the
+HTTP client needs credentials from the environment and is not exercised by the gate.
+
+**Consequence.** The outage behaviour (queue, stay pending, no attempt counted, submit exactly once
+on recovery) is tested against real Postgres with no network. The device is not mocked in the
+"fake the database" sense: the mock is the device, and it is the same interface the real device
+implements.
+
+## ADR-0038 — H3 test numbering continues from 63; H3 owns 64–68
+
+**Context.** H1 owns 49–52, H2 owns 53–63 (ADR-0033). The H3 brief describes behaviours rather than
+fixed numbers, so the new tests continue from the highest number present (ADR-0010, ADR-0026).
+
+**Decision.** H3 owns **64–68** in `tests/fiscal-h3.test.ts`:
+
+| H3 behaviour | Canonical | Test |
+| --- | --- | --- |
+| Pending fiscal row enqueued in the sale's own transaction | 64 | A sale inserts its pending fiscal row; a rollback inserts none |
+| Real rejection retries with backoff; 5 rejections fail | 65 | Backoff, the attempt cap, and the append-only attempts |
+| Outage keeps the row pending and does not count an attempt | 65b | A network outage is not a rejection |
+| Reliable submission after an outage, exactly once | 66 | 10 sales queue while down; all 10 submit once on recovery |
+| Number blocks: top up before exhaustion; clear error; no reuse | 67 | The block is refilled early; offline exhaustion fails clearly |
+| Two workers never submit the same invoice twice | 68 | Concurrent passes with SKIP LOCKED submit each invoice once |
+
+**Consequence.** No number is reused and no test is dropped. The prior 63 tests are untouched.

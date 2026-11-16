@@ -47,6 +47,21 @@ export interface PosSaleReceiptPayment {
   changeGiven: Decimal;
 }
 
+/**
+ * The receipt's fiscal block (H3). When the FDMS has accepted the invoice, the signature and QR
+ * code come from the device's response. Otherwise the receipt reads "fiscal pending". What ZIMRA
+ * requires a receipt to show is an open item (ADR-0003, ADR-0036); this only reports what the
+ * device returned.
+ */
+export interface PosSaleFiscal {
+  status: 'sent' | 'pending' | 'none';
+  signature: string | null;
+  qrCode: string | null;
+  receiptNo: string | null;
+  sentAt: string | null;
+  message: string | null;
+}
+
 export interface PosSaleReceipt {
   saleId: string;
   invoiceId: string;
@@ -58,6 +73,7 @@ export interface PosSaleReceipt {
   currency: string;
   lines: PosSaleReceiptLine[];
   payments: PosSaleReceiptPayment[];
+  fiscal: PosSaleFiscal;
 }
 
 interface RawReceipt {
@@ -88,6 +104,14 @@ interface RawReceipt {
     base_amount: string;
     change_given: string;
   }>;
+  fiscal: {
+    status: string;
+    signature?: string | null;
+    qr_code?: string | null;
+    receipt_no?: string | null;
+    sent_at?: string | null;
+    message?: string | null;
+  } | null;
 }
 
 function toReceipt(raw: RawReceipt): PosSaleReceipt {
@@ -119,6 +143,19 @@ function toReceipt(raw: RawReceipt): PosSaleReceipt {
       baseAmount: moneyFromSql(payment.base_amount),
       changeGiven: moneyFromSql(payment.change_given),
     })),
+    fiscal: toFiscal(raw.fiscal),
+  };
+}
+
+function toFiscal(raw: RawReceipt['fiscal']): PosSaleFiscal {
+  const status = raw?.status === 'sent' ? 'sent' : raw?.status === 'pending' ? 'pending' : 'none';
+  return {
+    status,
+    signature: raw?.signature ?? null,
+    qrCode: raw?.qr_code ?? null,
+    receiptNo: raw?.receipt_no ?? null,
+    sentAt: raw?.sent_at ?? null,
+    message: raw?.message ?? null,
   };
 }
 

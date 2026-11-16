@@ -73,6 +73,10 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'fiscal_device_integration', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'fiscal_jobs', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'fiscal_job_attempts', scope: 'branch', highVolume: true, partitioned: false },
+  // H3 (fiscal and numbering): the branch FDMS queue and cloud-issued number blocks.
+  { name: 'fiscal_invoices', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'fiscal_invoice_attempts', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'number_blocks', scope: 'branch', highVolume: true, partitioned: false },
   // H1 (branch server): device registration, local PIN auth, sync state.
   { name: 'device_registrations', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'cashier_pins', scope: 'branch', highVolume: true, partitioned: false },
@@ -501,6 +505,27 @@ export async function seedOneRowPerTenantTable(
        (org_id, branch_id, job_id, attempt_no, outcome, error)
      values ($1, $2, $3, 1, 'unreachable', 'seed')`,
     [orgId, branchId, fiscalJob[0]!.id],
+  );
+
+  // H3 (fiscal and numbering): the branch FDMS queue and a cloud-issued number block.
+  const fiscalInvoice = await sql<{ id: string }>(
+    `insert into public.fiscal_invoices (org_id, branch_id, invoice_id, fdms_payload, status)
+     values ($1, $2, $3, '{"seed": true}'::jsonb, 'pending') returning id`,
+    [orgId, branchId, invoiceId],
+  );
+
+  await sql(
+    `insert into public.fiscal_invoice_attempts
+       (org_id, branch_id, fiscal_invoice_id, attempt_no, outcome, error)
+     values ($1, $2, $3, 1, 'unreachable', 'seed')`,
+    [orgId, branchId, fiscalInvoice[0]!.id],
+  );
+
+  await sql(
+    `insert into public.number_blocks
+       (org_id, branch_id, series_code, block_no, first_value, last_value, next_value)
+     values ($1, $2, 'INVOICE', 1, 1, 200, 1)`,
+    [orgId, branchId],
   );
 
   // H1 (branch server): device registration, local PIN auth, sync state.

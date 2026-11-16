@@ -861,3 +861,116 @@ $ scripts/check-tenant-tables.sql
   `tests/retail-r2.test.ts` test 8 (the `get_price` index). On a freshly seeded database the planner
   sometimes prefers a different index because of statistics. They are not weakened, skipped or
   mocked, and each passes on its own when the planner cooperates.
+
+## H3 — Fiscal and numbering (queue-based FDMS submission, branch-local number blocks)
+
+### What was built
+
+* **Migration** `supabase/migrations/20260101090000_fiscal_numbering_h3.sql`:
+  * `public.fiscal_invoices` (branch-scoped): `org_id`, `branch_id`, `invoice_id` (unique per org),
+    `invoice_no`, `fdms_payload` JSONB, `status` (`pending` | `sent` | `failed`), `fdms_response`
+    JSONB, `attempts`, `next_attempt_at`, `last_error`. RLS forced, the standard branch-scoped
+    indexes, FK index on `invoice_id`, `updated_at` trigger.
+  * `public.fiscal_invoice_attempts` (branch-scoped, APPEND-ONLY): one row per real submission
+    attempt (`outcome`: `sent` | `failed` | `unreachable`). Immutability triggers reject UPDATE and
+    DELETE.
+  * `public.number_blocks` (branch-scoped): cloud-issued contiguous invoice-number ranges
+    (`series_code`, `block_no`, `first_value`, `last_value`, `next_value`), unique per
+    `(org_id, branch_id, series_code, block_no)`.
+  * Functions: `app.fiscal_invoice_enqueue` (idempotent per `(org_id, invoice_id)`, branch-gated by
+    `app.branch_mode_enabled()`), `app.fiscal_claim_pending` (`FOR UPDATE SKIP LOCKED`, due rows
+    oldest-first), `app.fiscal_invoice_attempt` (records an attempt; `sent` on success, `+1 attempt`
+    and `failed` at 5 on a real rejection, nothing on an outage), `app.fiscal_invoice_queue`,
+    `app.fiscal_invoice_summary`, `app.fiscal_invoice_retry`, `app.fiscal_invoice_manual_send`.
+  * Number blocks: `app.issue_number_block` (cloud; carves a range from `number_series` under
+    `FOR UPDATE`), `app.store_number_block` (branch; idempotent), `app.number_block_active` /
+    `app.number_block_status`, and `app.claim_invoice_number` (block-aware). `app.next_number` for
+    the `INVOICE` series now routes to `app.claim_invoice_number`, so `app.create_invoice` is
+    unchanged in shape and a branch with no block falls back to the org series.
+  * Re-created (additively) `app.create_invoice` and `app.pos_sale_receipt`: the invoice now enqueues
+    its pending fiscal row in the same transaction, and the receipt carries a `fiscal` block
+    (signature/QR when sent, else "fiscal pending").
+* **TypeScript** `src/fiscal/`:
+  * `fdms.ts` — the `FdmsClient` interface, `MockFdmsClient` (outage switch, rejection counter,
+    accepted-invoice record) and `httpFdmsClient` (real device; needs credentials).
+  * `queue.ts` — `listFiscalQueue`, `fiscalSummary`, `retryFiscalInvoice`, `manualSendFiscalInvoice`,
+    `claimPendingFiscalInvoices`, `recordFiscalOutcome`, `runFiscalPassOn` (one pass, one
+    transaction, the claim lock held for the whole pass).
+  * `invoiceWorker.ts` — `runFiscalPass` (a pass in its own transaction) and `startFiscalLoop` (the
+    long-lived worker loop, default every 5s; a pass that throws does not stop the loop).
+  * `numberBlocks.ts` — `numberBlockStatus`, `issueNumberBlock`, `storeNumberBlock`,
+    `cloudBlockFetcher`, and `ensureNextBlock` (top up before exhaustion; an offline fetch is a
+    no-op).
+  * `index.ts` re-exports all of it.
+* **API routes** (thin): `GET /api/fiscal/invoices`, `POST /api/fiscal/invoices/:id/retry`,
+  `POST /api/fiscal/invoices/:id/send`, `GET/POST /api/fiscal/numbers`,
+  `POST /api/branch/numbers/claim` (cloud side).
+* **Admin page** `/settings/fiscal` (queue with counts by status, retry, manual submit).
+* **Branch loop** `npm run branch:fiscal` (`scripts/branch-fiscal-loop.ts`).
+* **Receipt**: `PosSaleReceipt` / `PosReceipt` carry a `fiscal` block; `/pos` renders the signature
+  and QR when sent, else "fiscal pending".
+
+### The H3 tests
+
+`tests/fiscal-h3.test.ts` (64–68, ADR-0038), run against the real local Postgres on a branch-mode
+connection (`app.branch_mode=branch`), with the in-memory FDMS device:
+
+* 64 — a sale enqueues its pending fiscal row in the same transaction; a rollback enqueues none.
+* 65 — a real rejection retries with backoff; 5 rejections move the row to `failed`; attempts are
+  append-only.
+* 65b — a network outage keeps the row pending and does NOT increase the attempt count.
+* 66 — 10 sales queue while FDMS is down; when it returns all 10 submit exactly once.
+* 67 — the next block is requested before the current one runs out; offline exhaustion fails with a
+  clear message and reuses no number.
+* 68 — two fiscal workers running at once (FOR UPDATE SKIP LOCKED) never submit the same invoice
+  twice.
+
+### Gate evidence (H3)
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.   (all 17 migrations applied)
+
+$ npm test
+ Test Files  14 passed (14)
+      Tests  97 passed (97)
+   (all 6 H3 tests pass. The two pre-existing EXPLAIN-plan assertions, retail-r1 test 2 and
+    retail-r2 test 8, are planner-statistics-dependent and can flake when the database accumulates
+    rows across repeated runs; both reproduce with the H3 changes stashed. On a fresh
+    `supabase db reset` the full suite is green, which is the gate order. See Notes.)
+
+$ npm run build
+ ✓ Compiled successfully
+ ✓ Generating static pages (32/32)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+### Notes
+
+* `fiscal_invoices`, `fiscal_invoice_attempts` and `number_blocks` are registered in
+  `tests/support/tenant-tables.ts` and `scripts/check-tenant-tables.sql`, so the table-driven RLS
+  test (test 2), the FK-index check (test 9), the schema check (test 10) and the high-volume index
+  check (test 11) cover them without a special case.
+* The fiscal enqueue is branch-only (ADR-0035): the cloud's replayed invoices never queue fiscal
+  rows and the cloud never talks to FDMS. Tests that exercise the branch set `app.branch_mode=branch`
+  on their connection.
+* Invoice numbering uses cloud-issued branch-local blocks (ADR-0036). Two branches cannot receive the
+  same number, a number is never reused, and an offline branch fails a sale with a catchable error
+  only when its blocks are truly exhausted.
+* The FDMS device is an interface (ADR-0037); the mock is the device, not a database mock, and the
+  outage behaviour is exercised against real Postgres with no network.
+* H3's tests are numbered 64–68 because H1 owns 49–52 and H2 owns 53–63 (ADR-0038).
+* Pre-existing flaky tests, unrelated to H3 (each reproduces with the H3 changes stashed): the
+  EXPLAIN-plan assertions `tests/retail-r1.test.ts` test 2 (`products_name_trgm_idx`) and
+  `tests/retail-r2.test.ts` test 8 (the `get_price` index). They assert a planner choice, which
+  depends on table statistics; repeated runs without a reset accumulate rows and can tip the
+  planner to a different index. They are not weakened, skipped or mocked: each passes on its own,
+  and the full suite is green after the gate's `supabase db reset`.

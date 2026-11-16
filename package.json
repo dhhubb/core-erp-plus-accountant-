@@ -10,6 +10,7 @@
     "branch:https": "bash scripts/branch-https.sh",
     "branch:backup": "tsx scripts/branch-backup.ts",
     "branch:sync": "tsx scripts/branch-sync-loop.ts",
+    "branch:fiscal": "tsx scripts/branch-fiscal-loop.ts",
     "lint": "next lint",
     "test": "vitest run --reporter=verbose",
     "test:perf": "tsx scripts/perf.ts",

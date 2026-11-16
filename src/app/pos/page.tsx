@@ -344,6 +344,14 @@ export default function PosPage() {
           base_amount: string;
           change_given: string;
         }>;
+        fiscal?: {
+          status: string;
+          signature?: string | null;
+          qr_code?: string | null;
+          receipt_no?: string | null;
+          sent_at?: string | null;
+          message?: string | null;
+        } | null;
       };
 
       const nextReceipt: PosReceipt = {
@@ -373,6 +381,19 @@ export default function PosPage() {
           baseAmount: new Decimal(payment.base_amount),
           changeGiven: new Decimal(payment.change_given),
         })),
+        fiscal: {
+          status:
+            payload.fiscal?.status === 'sent'
+              ? 'sent'
+              : payload.fiscal?.status === 'pending'
+                ? 'pending'
+                : 'none',
+          signature: payload.fiscal?.signature ?? null,
+          qrCode: payload.fiscal?.qr_code ?? null,
+          receiptNo: payload.fiscal?.receipt_no ?? null,
+          sentAt: payload.fiscal?.sent_at ?? null,
+          message: payload.fiscal?.message ?? null,
+        },
       };
 
       setReceipt(nextReceipt);
@@ -643,6 +664,24 @@ function Receipt({ receipt }: { receipt: PosReceipt }) {
           </p>
         ))}
       </section>
+
+      {receipt.fiscal.status === 'sent' ? (
+        <section className="fiscal" data-testid="receipt-fiscal">
+          {receipt.fiscal.receiptNo && <p>Fiscal {receipt.fiscal.receiptNo}</p>}
+          {receipt.fiscal.signature && (
+            <p data-testid="fiscal-signature">Signature {receipt.fiscal.signature}</p>
+          )}
+          {receipt.fiscal.qrCode && (
+            <p data-testid="fiscal-qr" className="qr">
+              QR {receipt.fiscal.qrCode}
+            </p>
+          )}
+        </section>
+      ) : (
+        <section className="fiscal" data-testid="receipt-fiscal">
+          <p data-testid="fiscal-pending">Fiscal pending</p>
+        </section>
+      )}
 
       <footer>
         <p>Thank you</p>

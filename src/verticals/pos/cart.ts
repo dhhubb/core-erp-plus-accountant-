@@ -48,6 +48,15 @@ export interface PosReceiptPayment {
   changeGiven: Decimal;
 }
 
+export interface PosReceiptFiscal {
+  status: 'sent' | 'pending' | 'none';
+  signature: string | null;
+  qrCode: string | null;
+  receiptNo: string | null;
+  sentAt: string | null;
+  message: string | null;
+}
+
 export interface PosReceipt {
   saleId: string;
   invoiceNo: string;
@@ -58,6 +67,7 @@ export interface PosReceipt {
   changeTotal: Decimal;
   lines: PosReceiptLine[];
   payments: PosReceiptPayment[];
+  fiscal: PosReceiptFiscal;
 }
 
 export type PosStatus = 'idle' | 'posting' | 'paid' | 'queued' | 'error';
