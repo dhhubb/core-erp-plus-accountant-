@@ -897,3 +897,79 @@ speed, and must be under 1 second.
 
 **Consequence.** No number is reused and no prior test is touched. The timing is observable on the
 till and asserted in a unit test with an injected clock, so it is not flaky.
+
+## ADR-0042 — H5 owns tests 75–84; the wizard is a staged import, not a live write
+
+**Context.** H5 brings a shop's products, customers and opening stock from Pastel onto a branch so
+the branch works offline. The H4 brief owns 69–74 (ADR-0041), so the new tests continue from the
+highest number present (ADR-0010, ADR-0026). A Pastel export is large (a real shop has thousands of
+products) and the shop must see what will happen before it happens.
+
+**Decision.** H5 owns **75–84** in `tests/import-h5.test.ts`:
+
+| H5 behaviour | Canonical | Test |
+| --- | --- | --- |
+| 5,000 products import under 2 s using COPY | 75 | The whole wizard on `samples/products-5000.csv` |
+| Invalid rows are reported by row number and block commit until fixed | 76 | `samples/products-with-errors.csv`, then PATCH + revalidate + commit |
+| A failed import leaves no partial data and a re-run duplicates nothing | 77 | Duplicate external code rolls the whole job back; the good file re-runs as updates |
+| Opening stock writes opening ledger rows and one balanced journal | 78 | `samples/opening-stock.csv` posts Dr Inventory / Cr 3900 |
+| Opening stock is idempotent | 79 | A re-run skips every already-committed row |
+| Customers import by external code and are idempotent | 80 | `samples/customers.csv` |
+| The column mapping is validated and saved per shop | 81 | `app.import_save_mapping` / `app.import_get_mapping` |
+| The import tables are tenant-scoped and well-formed | 82 | RLS forced, the branch index, FK indexes |
+| `applyMapping` / `naturalKey` unit behaviour | 83 | Pure mapping functions |
+| Chunked load numbers rows contiguously | 84 | Two COPY chunks, one row-number sequence |
+
+The wizard stages first and commits second. Parsing happens in the browser (PapaParse); the parsed
+rows travel to the branch in chunks and land in `import_rows` with COPY. Validation is one SQL pass
+over the staged rows. Commit is a single SQL function (`app.import_commit_job`) in one transaction:
+either the whole file applies or none of it does.
+
+**Consequence.** The shop sees a preview and a per-row problem list before anything is written, and
+a bad file cannot leave half a catalogue behind. No number is reused and no prior test is touched.
+
+## ADR-0043 — The import writes through the core posting functions; opening stock is a ledger fact
+
+**Context.** Opening stock is real inventory with a real cost, so it must appear in the stock ledger
+(and therefore in `stock_balances` and the FIFO layers) and it must balance in the accounting engine.
+The core already owns both: `app.post_stock_adjustment` posts a stock movement and its journal, and
+`app.post_balanced_journal` posts a balanced journal through the one hook.
+
+**Decision.** The import never writes a core ledger table directly and never invents its own journal.
+Products go in through the ordinary `products` / `product_variants` / `price_list_items` tables
+(additive; no core table is altered). Opening stock inserts append-only `stock_ledger` rows with
+`source_type = 'opening'`, their `stock_layer_balances` layers and the `stock_balances` cache in the
+same transaction, then posts **one** balanced journal for the whole file through
+`app.post_balanced_journal` (Dr Inventory 1300, Cr Opening Balance Equity 3900). The credit account
+is created by an additive `create or replace` of `app.create_default_accounts` (3900 added for new
+orgs) plus an `insert ... on conflict do nothing` for orgs that already exist. Invoice numbering
+still goes through `app.next_number` -> `app.claim_invoice_number`; the import only ever calls the
+SKU series.
+
+**Consequence.** Opening stock is a first-class ledger fact: a subsequent sale consumes it FIFO at
+the imported cost, and the balance sheet shows it. Re-running the same file skips the rows that were
+already committed (matched on product + warehouse), so it never double-counts. Core tables and the
+invoice-number path are untouched.
+
+## ADR-0044 — Bulk SKU allocation locks the series once; imports are skipped, not re-posted
+
+**Context.** Test 75 requires 5,000 products in under 2 seconds. A first cut called
+`app.next_number(org, 'SKU')` once per row: each call takes `SELECT ... FOR UPDATE` on the
+`number_series` row, which measured ~0.14 ms, so 5,000 rows cost ~700 ms on their own. A second cut
+joined the staged rows to `products` on `nullif(btrim(coalesce(data ->> 'external_code','')),'')` —
+an **expression**, so the index on `(org_id, external_code)` was not used and the planner fell back
+to a nested loop: 12.5 M row comparisons and a 4-second insert.
+
+**Decision.** Two changes. (1) `app.next_numbers(org, code, count)` locks the series **once** and
+returns a contiguous, gapless block; the import allocates all its SKUs in one call and distributes
+them with `row_number()`. It reads `number_series` directly, so it is only used for series that are
+not carved into branch blocks (SKU, PO, ...); invoice numbers keep going through
+`app.next_number` -> `app.claim_invoice_number`. (2) The commit resolves the mapped rows into a
+materialised temporary table (`import_src` / `import_open`) and joins on the **stored** column, so
+the index is used. Idempotency for opening stock is a `skipped` row status set during validation when
+a matching `stock_ledger` `source_type = 'opening'` row already exists for that product and
+warehouse; a skipped row is neither re-validated into an error nor re-posted.
+
+**Consequence.** A 5,000-product commit fell from ~11 s to ~1.2 s (COPY staging is ~0.2 s). Gapless
+allocation is preserved because the whole block is reserved in one locked update. A re-run of an
+opening-stock file is a no-op rather than a second journal.

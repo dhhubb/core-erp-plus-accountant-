@@ -321,3 +321,48 @@ The relay is branch-only and outbound-only (decision 16); nothing here blocks a 
 * Endpoints: `GET/PUT /api/pos/printer`, `POST /api/pos/printer/test`, `POST /api/branch/print`
   (branch-only; writes the decoded bytes to the printer socket).
 * Pages: `/pos` (till, with the receipt and timings), `/pos/settings` (printer and scanner settings).
+
+## H5 extension (Migration wizard)
+
+Additive, recorded in ADR-0042 to ADR-0044. It changes no core table and no core function signature;
+it adds three branch-scoped tables, a set of import functions, and one bulk-allocation helper that
+the import uses to take SKUs in one locked block.
+
+* New branch-scoped tables: `import_jobs` (one row per wizard run; `kind` `products` | `customers` |
+  `opening_stock`; `status` `draft` | `validated` | `invalid` | `committed`; the `mapping` the run
+  used and the commit `result`), `import_rows` (the staged rows: `row_no`, the mapped `data` JSON,
+  the per-row `errors`, the `natural_key` it is deduped on, and `status`), and `import_mappings` (the
+  saved column mapping per `(org_id, branch_id, kind)`).
+* `app.import_row_errors(kind, data)` — the pure per-row validation rules, returning a JSON array of
+  `{ field, message }`.
+* `app.import_natural_key(kind, data)` — the idempotency key; only opening stock has one
+  (product + warehouse).
+* `app.next_numbers(org_id, code, count)` — locks the series **once** and returns a contiguous,
+  gapless block. For series that are not carved into branch blocks (SKU, PO, ...). Invoice numbers
+  still go through `app.next_number` -> `app.claim_invoice_number`.
+* `app.ensure_retail_price_list(org_id)` — the org's retail price list, created on first use.
+* `app.import_job_create(org_id, branch_id, kind, source_name, mapping)` — open a job.
+* `app.import_validate_job(org_id, branch_id, job_id)` — validate every staged row in one set-based
+  pass; marks rows `valid`, `invalid` or `skipped` and returns the counts.
+* `app.import_update_row(org_id, branch_id, row_id, data)` — fix one row and revalidate it.
+* `app.import_commit_job(org_id, branch_id, job_id, posting_date)` — apply the whole job in one
+  transaction; refuses while any row is invalid; returns the created/updated/skipped counts, the
+  journal id and the total value.
+* `app.import_job_rows(org_id, branch_id, job_id, limit, after_row_no)` — a keyset page of rows by
+  row number.
+* `app.import_save_mapping` / `app.import_get_mapping` — the saved mapping per shop.
+* `app.create_default_accounts` is replaced additively: `3900 Opening Balance Equity` is added for
+  new orgs, and an `insert ... on conflict do nothing` gives it to orgs that already exist. The
+  `journals` `source_type` check gains `opening`.
+* TypeScript:
+  * `src/verticals/import/mapping.ts` (`IMPORT_FIELDS`, `IMPORT_KINDS`, `validateMapping`,
+    `suggestMapping`, `applyMapping`, `naturalKey`) — pure column-mapping logic.
+  * `src/verticals/import/csv.ts` (`IMPORT_CHUNK_SIZE`, `chunkRows`, `parseCsv`, `csvLine`) — the
+    browser/test CSV helpers.
+  * `src/verticals/import/jobs.ts` (`createImportJob`, `loadImportChunk`, `stageImportRows`,
+    `validateImportJob`, `updateImportRow`, `commitImportJob`, `listImportRows`,
+    `getImportMapping`, `saveImportMapping`) — the wizard's data access, over `pg`/COPY.
+* Endpoints: `POST /api/import/jobs`, `POST /api/import/jobs/:id/chunks`,
+  `POST /api/import/jobs/:id/validate`, `POST /api/import/jobs/:id/commit`,
+  `GET /api/import/jobs/:id/rows`, `PATCH /api/import/rows/:id`, `GET/PUT /api/import/mappings`.
+  Page `/settings/import` (the wizard).

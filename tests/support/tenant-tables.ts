@@ -79,6 +79,10 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'number_blocks', scope: 'branch', highVolume: true, partitioned: false },
   // H4 (hardware and receipts): the branch's printer configuration.
   { name: 'printer_settings', scope: 'branch', highVolume: true, partitioned: false },
+  // H5 (migration wizard): the staging tables and the saved column mappings.
+  { name: 'import_jobs', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'import_rows', scope: 'branch', highVolume: true, partitioned: false },
+  { name: 'import_mappings', scope: 'branch', highVolume: true, partitioned: false },
   // H1 (branch server): device registration, local PIN auth, sync state.
   { name: 'device_registrations', scope: 'branch', highVolume: true, partitioned: false },
   { name: 'cashier_pins', scope: 'branch', highVolume: true, partitioned: false },
@@ -527,6 +531,25 @@ export async function seedOneRowPerTenantTable(
     `insert into public.number_blocks
        (org_id, branch_id, series_code, block_no, first_value, last_value, next_value)
      values ($1, $2, 'INVOICE', 1, 1, 200, 1)`,
+    [orgId, branchId],
+  );
+
+  // H5 (migration wizard): a job, its staged rows and a saved mapping.
+  const importJob = await sql<{ id: string }>(
+    `insert into public.import_jobs (org_id, branch_id, kind, mapping)
+     values ($1, $2, 'products', '{"StockCode": "external_code"}'::jsonb) returning id`,
+    [orgId, branchId],
+  );
+
+  await sql(
+    `insert into public.import_rows (org_id, branch_id, job_id, row_no, data)
+     values ($1, $2, $3, 1, '{"external_code": "P1", "name": "Seed"}'::jsonb)`,
+    [orgId, branchId, importJob[0]!.id],
+  );
+
+  await sql(
+    `insert into public.import_mappings (org_id, branch_id, kind, mapping)
+     values ($1, $2, 'products', '{"StockCode": "external_code"}'::jsonb)`,
     [orgId, branchId],
   );
 

@@ -821,6 +821,58 @@ curl -X POST https://cloud.example/api/pos/printer/test -H "Authorization: Beare
 **The printer table.** `public.printer_settings` (org + branch) carries `org_id`, `created_at`, forced
 RLS and the standard indexes, and is registered in `scripts/check-tenant-tables.sql`.
 
+## Migration wizard (H5)
+
+H5 brings a shop's products, customers and opening stock off Pastel and onto a branch, so the branch
+works offline from day one. See ADR-0042 to ADR-0044. It adds no core-table change; opening stock is
+posted through the core accounting and inventory functions.
+
+**The page.** `/settings/import` on the branch. Pick what you are importing, choose the CSV, then:
+
+1. **Preview and map.** PapaParse parses the whole file in the browser, so nothing is uploaded until
+   you press Start. The wizard guesses a mapping from the Pastel headings (StockCode, Description,
+   SellingPrice, ...) and shows the first rows. Correct any column, then **Save this mapping** — it is
+   stored per shop and reused next time.
+2. **Stage and check.** The parsed rows are sent to the branch in chunks (500 rows each) and land in
+   `import_rows` with COPY. Validation is one SQL pass: each row is `valid`, `invalid` (with a
+   message against the field) or `skipped` (already imported). Invalid rows are listed by their line
+   number in the file and can be fixed in place.
+3. **Commit.** One click applies the whole file in one transaction. A single bad row blocks the
+   commit, and a failure part-way through rolls the whole job back.
+
+```bash
+# Open a job and stage the first chunk (a branch member's token; org and branch come from the token)
+curl -X POST https://branch.example/api/import/jobs   -H "Authorization: Bearer <token>" -H 'Content-Type: application/json'   -d '{"kind": "products", "source_name": "products.csv", "mapping": {"StockCode": "external_code"},
+       "rows": [{"external_code": "P1", "name": "Widget"}]}'
+
+# Stage more chunks, validate, commit
+curl -X POST https://branch.example/api/import/jobs/<id>/chunks   -H "Authorization: Bearer <token>" -H 'Content-Type: application/json'   -d '{"start_row_no": 501, "rows": [...]}'
+curl -X POST https://branch.example/api/import/jobs/<id>/validate -H "Authorization: Bearer <token>"
+curl -X POST https://branch.example/api/import/jobs/<id>/commit -H "Authorization: Bearer <token>"
+```
+
+**Opening stock.** An opening-stock row becomes an append-only `stock_ledger` row with
+`source_type = 'opening'`, its FIFO layer and the `stock_balances` cache, and the whole file posts
+**one** balanced journal (Dr Inventory 1300, Cr Opening Balance Equity 3900) through the core
+balanced-journal hook. A later sale therefore consumes the imported stock at the imported cost.
+Re-running the same file skips every row that was already committed, so it never double-counts.
+
+**Products and customers.** Products are upserted by their Pastel code (external code) and get a
+default variant and a retail price, so an imported product is sellable at the till immediately.
+Customers are upserted by their Pastel code. Both are idempotent: a re-run updates rather than
+duplicates.
+
+**Speed.** SKUs are allocated in one locked block (`app.next_numbers`) rather than one
+`next_number` call per row, and the commit joins on stored columns so the indexes are used. A
+5,000-product file stages in ~0.2 s and commits in ~1.2 s.
+
+**Sample files.** `samples/` carries `products-5000.csv`, `customers.csv`, `opening-stock.csv` and
+`products-with-errors.csv`, so the wizard can be exercised end to end.
+
+**The import tables.** `public.import_jobs`, `public.import_rows` and `public.import_mappings` (org +
+branch) each carry `org_id`, `created_at`, forced RLS and the standard indexes, and are registered
+in `scripts/check-tenant-tables.sql`.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core

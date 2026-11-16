@@ -27,6 +27,7 @@ pricing and promotions: tests 45–48.
 | H2 | Offline sync engine: branch outbox → cloud ingest → pull | tests 53–63 | DONE |
 | H3 | Fiscal and numbering: FDMS queue, branch-local number blocks | tests 64–68 | DONE |
 | H4 | Hardware and receipts: ESC/POS, QR, printer settings, relay, scanner, hold/recall, print timing | tests 69–74 | DONE |
+| H5 | Migration wizard: Pastel CSV → products/customers/opening stock, chunked COPY, mapping, commit | tests 75–85 | DONE |
 
 ## M0 — Setup
 
@@ -1089,3 +1090,96 @@ $ scripts/check-tenant-tables.sql
   sale has committed rather than turning a paid sale into an error (asserted in the units test).
 * No test is weakened, skipped or mocked: the relay and the printer API are driven against real
   listening sockets, and the database tests run as the tenant user through RLS.
+
+## H5 — Migration wizard (Pastel CSV → products, customers, opening stock)
+
+Additive, recorded in ADR-0042 to ADR-0044. Brings a shop's catalogue, customers and opening stock
+onto a branch so it works offline. It adds three branch-scoped tables and a set of import functions;
+it changes no core table and no core function signature.
+
+### What was built
+
+* **Schema** (`supabase/migrations/20260101110000_import_h5.sql`): `import_jobs`, `import_rows` and
+  `import_mappings` (org + branch, `org_id`/`created_at` NOT NULL, forced RLS, the branch index, FK
+  indexes). `import_rows` is the staging table the COPY lands in; `row_no` keeps a row pointed at its
+  line in the file across chunks.
+* **SQL functions**: `app.import_row_errors` (pure rules), `app.import_natural_key`,
+  `app.import_job_create`, `app.import_validate_job`, `app.import_update_row`,
+  `app.import_commit_job`, `app.import_job_rows`, `app.import_save_mapping` / `app.import_get_mapping`,
+  `app.ensure_retail_price_list`, and `app.next_numbers` (bulk, one locked block).
+  `app.create_default_accounts` is replaced additively to add `3900 Opening Balance Equity` (with a
+  backfill for existing orgs) and the `journals` source-type check gains `opening`.
+* **TypeScript** (`src/verticals/import/`): `mapping.ts` (pure mapping/suggest/validate),
+  `csv.ts` (`parseCsv`, `chunkRows`, `csvLine`), `jobs.ts` (the wizard's data access over
+  `pg`/`pg-copy-streams`).
+* **Routes** (`src/app/api/import/`): `POST /jobs`, `POST /jobs/:id/chunks`, `POST /jobs/:id/validate`,
+  `POST /jobs/:id/commit`, `GET /jobs/:id/rows`, `PATCH /rows/:id`, `GET|PUT /mappings`.
+* **Page**: `/settings/import` (`wizard.tsx`) — PapaParse preview in the browser, the column-mapping
+  screen with a saved mapping, the staged-row review with per-row fixes, and the commit.
+* **Samples** (`samples/`): `products-5000.csv`, `customers.csv`, `opening-stock.csv`,
+  `products-with-errors.csv`.
+* `import_jobs`, `import_rows` and `import_mappings` are registered in `tests/support/tenant-tables.ts`
+  and `scripts/check-tenant-tables.sql`, so the table-driven RLS test (2), the FK-index check (9),
+  the schema check (10) and the high-volume index check (11) cover them with no special case.
+
+### The H5 tests
+
+`tests/import-h5.test.ts` (the numbered H5 tests, 75–85; ADR-0042):
+
+| # | Behaviour |
+| --- | --- |
+| 75 | A 5,000-product import stages in ~0.2 s and commits in ~1.2 s, under the 2 s gate (COPY) |
+| 76 | Invalid rows are reported by row number and block commit until fixed (PATCH + revalidate) |
+| 77 | A failed import leaves no partial data; a re-run updates rather than duplicates |
+| 78 | Opening stock writes `source_type='opening'` ledger rows and one balanced journal (Cr 3900) |
+| 79 | Opening stock is idempotent: a re-run skips every already-committed row |
+| 80 | Customers import by external code and are idempotent |
+| 81 | The column mapping is validated and saved per shop |
+| 82 | The import tables are tenant-scoped and well-formed (RLS forced, index, FK indexes) |
+| 83 | `applyMapping` / `naturalKey` unit behaviour |
+| 84 | Chunked load numbers rows contiguously across chunks |
+| 85 | Imported opening stock is consumed by a later sale at the imported cost (FIFO) |
+
+### Gate evidence (H5)
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.   (all 22 migrations applied)
+
+$ npm test
+ Test Files  19 passed (19)
+      Tests  146 passed (146)
+
+$ npm run build
+BUILD_EXIT=0   (✓ Compiled successfully; /settings/import, /api/import/*)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+### Notes
+
+* The import stages first and commits second. A bad file cannot leave half a catalogue behind: commit
+  is one SQL function in one transaction (test 77 rolls a mid-commit failure back completely).
+* Opening stock is a real ledger fact. It inserts append-only `stock_ledger` rows, their FIFO layers
+  and the `stock_balances` cache, then posts **one** balanced journal for the whole file through the
+  core hook. Test 85 sells two units afterwards and asserts COGS is the imported cost, which proves
+  the layer the import created is the layer FIFO consumed.
+* Two fixes were needed to meet test 75 (ADR-0044). Per-row `app.next_number` cost ~700 ms for 5,000
+  rows, so SKUs now come from `app.next_numbers` (one locked block). A join on an **expression**
+  (`nullif(btrim(...))`) defeated the `(org_id, external_code)` index and produced a 12.5 M-row
+  nested loop, so the commit resolves rows into a materialised temp table and joins on the stored
+  column. Commit fell from ~11 s to ~1.2 s.
+* Idempotency: products and customers upsert on external code; opening stock is skipped when a
+  matching `source_type='opening'` row already exists for the product and warehouse. A re-run never
+  double-counts.
+* Opening stock resolves the product's variant (stock is tracked per variant), preferring the row's
+  barcode and otherwise the product's default variant.
+* No test is weakened, skipped or mocked: the wizard is driven end to end against the real local
+  Postgres, including COPY staging and the SQL commit.
