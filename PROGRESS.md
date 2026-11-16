@@ -1183,3 +1183,98 @@ $ scripts/check-tenant-tables.sql
   barcode and otherwise the product's default variant.
 * No test is weakened, skipped or mocked: the wizard is driven end to end against the real local
   Postgres, including COPY staging and the SQL commit.
+
+## H6 — Reports and the owner console (profit, VAT, Z-reports; branch + cloud)
+
+Additive, recorded in ADR-0045 to ADR-0049. Gives the owner profit, VAT and Z-reports on the branch
+and in the cloud, with figures that match the ledger. It adds one branch-scoped fact table and a set
+of read-only report functions; it changes no core table (an index on `invoices` is additive) and no
+core function signature.
+
+### What was built
+
+* **Schema** (`supabase/migrations/20260101120000_reports_h6.sql`): `daily_product_sales`
+  (org + branch, APPEND-ONLY, one row per closed shift per business date per product + variant:
+  `qty`, `gross`, `tax`, `cogs`), with the branch index, a per-product index, the FK indexes, a
+  `(org_id, branch_id, product_id, business_date)` index for the report reads, and forced RLS. It is
+  immutable via `app.enforce_immutable`. Its unique key
+  `(org_id, branch_id, shift_id, business_date, product_id, variant_id)` makes the shift-close write
+  idempotent. An additive index `invoices (org_id, branch_id, invoice_date, id)` bounds the
+  today-read.
+* **SQL functions**: `app.record_shift_daily_facts` (called by the re-created `app.close_shift` in
+  the same transaction as the Z-report), `app.report_profit_by_product`, `app.report_product_ranking`
+  (with `app.report_best_sellers` / `app.report_slow_movers`), `app.report_vat`,
+  `app.report_z_reports`, `app.report_gl_period_profit` and `app.report_last_sync`.
+* **TypeScript** (`src/verticals/reports/`): `types.ts` and `reports.ts` (`profitByProduct`,
+  `productRanking`, `bestSellers`, `slowMovers`, `vatReport`, `zReports`, `glPeriodProfit`,
+  `lastSync`) — the report data access over `pg`, all money as `Decimal`.
+* **Routes** (`src/app/api/reports/`): `GET /profit`, `/best-sellers`, `/slow-movers`, `/vat`,
+  `/z-reports`, `/last-sync`, with a shared helper that parses the period, the limit (max 100) and
+  the keyset cursor, and refuses a branch the token does not scope.
+* **Page**: `/reports` — the owner console and the branch view in one, with a period picker, tabs,
+  the figures and a last-synced label.
+* `daily_product_sales` is registered in `tests/support/tenant-tables.ts` and
+  `scripts/check-tenant-tables.sql`, so the table-driven RLS test (2), the FK-index check (9), the
+  schema check (10) and the high-volume index check (11) cover it with no special case.
+
+### The H6 tests
+
+`tests/reports-h6.test.ts` (the numbered H6 tests, 86–95; ADR-0045):
+
+| # | Behaviour |
+| --- | --- |
+| 86 | Profit by product equals the GL for the period (a return nets out of both) |
+| 87 | Best sellers and slow movers are ranked by quantity |
+| 88 | The VAT report splits sales by the rate each line used, matching the Z-report |
+| 89 | Z-reports page with their fiscal totals, computed at read time |
+| 90 | A closed day is read from the facts; today is read live from the sales tables |
+| 91 | Keyset pagination returns every product exactly once across pages |
+| 92 | The daily facts are append-only, and a closed day cannot be changed |
+| 93 | `daily_product_sales` is a well-formed tenant table (RLS forced, indexes, no floats) |
+| 94 | A report reads only its own branch |
+| 95 | The report routes reject a limit above 100 and a branch out of scope; the sync label is well-formed |
+
+### Gate evidence (H6)
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.   (all 23 migrations applied)
+
+$ npm test
+ Test Files  20 passed (20)
+      Tests  156 passed (156)
+
+$ npm run build
+BUILD_EXIT=0   (✓ Compiled successfully; /reports, /api/reports/*)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+### Notes
+
+* **Two sources, one rule.** A closed day is read from the immutable facts (bounded at
+  `current_date - 1`); today is read live from `invoices` + `invoice_lines` (bounded by
+  `invoice_date = current_date`). The two never overlap, so a figure is counted once (test 90). No
+  materialised view is used (ADR-0046).
+* **Figures match the ledger.** The profit report is asserted equal to `app.report_gl_period_profit`,
+  which reads `journal_lines` straight (test 86). The VAT report and the Z-report's `vat_by_rate`
+  read the same `invoice_lines`, so they agree (test 88).
+* **Fiscal totals are read, not stored.** A Z-report row is immutable, but its invoices' fiscal
+  status changes after the close; the report computes sent / pending / failed at read time (test 89,
+  ADR-0047).
+* **A first cut was slow.** A union of facts + live rows aggregated the whole set (~800 ms on a
+  seeded day). The per-product reports now take a keyset page per source branch and merge the (at
+  most three) pages, so the closed-day side is a streaming index scan: a per-product page over 1M
+  closed-day facts measured ~6 ms (ADR-0045).
+* **One existing test flaked once.** R2 test 8 (`get_price` uses the price_list_items index) failed
+  a single time when run in the full suite right after a 1M-row perf seed had skewed planner
+  statistics; it passes on a fresh `supabase db reset` and in the full suite. No test was weakened.
+* No test is mocked: the reports are driven against the real local Postgres, through the SQL
+  functions and through the route handlers with a real access token.

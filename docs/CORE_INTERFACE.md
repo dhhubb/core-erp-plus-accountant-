@@ -366,3 +366,39 @@ the import uses to take SKUs in one locked block.
   `POST /api/import/jobs/:id/validate`, `POST /api/import/jobs/:id/commit`,
   `GET /api/import/jobs/:id/rows`, `PATCH /api/import/rows/:id`, `GET/PUT /api/import/mappings`.
   Page `/settings/import` (the wizard).
+
+## H6 extension (Reports and the owner console)
+
+Additive, recorded in ADR-0045 to ADR-0049. It changes no core table (an index on `invoices` is
+additive) and no core function signature. `app.close_shift` is re-created from R5 with the same
+signature; it now also writes the shift's daily facts in the same transaction.
+
+* New branch-scoped table: `daily_product_sales` (APPEND-ONLY): one row per closed shift, per
+  business date, per product and variant, holding `qty`, `gross`, `tax` and `cogs`. Written by
+  `app.record_shift_daily_facts` from `app.close_shift`; immutable via `app.enforce_immutable`; the
+  unique key `(org_id, branch_id, shift_id, business_date, product_id, variant_id)` makes the write
+  idempotent.
+* `app.record_shift_daily_facts(org_id, branch_id, shift_id, business_date)` — write the closed
+  shift's daily facts from its completed sale lines and their FIFO cost.
+* `app.close_shift(org_id, shift_id, closed_by)` — re-created from R5 with the same signature; now
+  also writes the shift's daily facts.
+* `app.report_profit_by_product(org_id, branch_id, from, to, limit, after_product_id)` — a keyset
+  page of per-product profit (revenue, cogs, profit), netting returns out. Closed days from the
+  facts, today live.
+* `app.report_product_ranking(org_id, branch_id, from, to, ascending, limit, ...)` — the ranked list;
+  `app.report_best_sellers` / `app.report_slow_movers` are thin wrappers.
+* `app.report_vat(org_id, branch_id, from, to)` — output VAT split by the rate each line used.
+* `app.report_z_reports(org_id, branch_id, limit, after_created_at, after_id)` — a keyset page of
+  Z-reports with their fiscal totals computed at read time (sent / pending / failed).
+* `app.report_gl_period_profit(org_id, branch_id, from, to)` — the GL period profit (revenue less
+  cogs) read straight from `journal_lines`; the profit report must equal it.
+* `app.report_last_sync(org_id, branch_id)` — the last cloud contact and the outbox size, for the
+  console's last-synced label.
+* TypeScript (`src/verticals/reports/`): `types.ts` and `reports.ts` (`profitByProduct`,
+  `productRanking`, `bestSellers`, `slowMovers`, `vatReport`, `zReports`, `glPeriodProfit`,
+  `lastSync`) — the report data access over `pg`, money as `Decimal`.
+* Endpoints: `GET /api/reports/profit`, `/best-sellers`, `/slow-movers`, `/vat`, `/z-reports`,
+  `/last-sync`. A limit above 100 is refused (422); a branch the token does not scope is refused
+  (403).
+* Page `/reports` — the owner console and the branch view in one (period picker, tabs, figures, a
+  last-synced label).

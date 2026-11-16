@@ -973,3 +973,111 @@ warehouse; a skipped row is neither re-validated into an error nor re-posted.
 **Consequence.** A 5,000-product commit fell from ~11 s to ~1.2 s (COPY staging is ~0.2 s). Gapless
 allocation is preserved because the whole block is reserved in one locked update. A re-run of an
 opening-stock file is a no-op rather than a second journal.
+
+## ADR-0045 — H6 owns tests 86–95; report reads stream on a keyset
+
+**Context.** H6 adds the reports and the owner console. H5 owns 75–85 (ADR-0042), so the new tests
+continue from the highest number present (ADR-0010, ADR-0026): H6 owns **86–95**. A report over a
+year of a busy shop is millions of rows, and the Phase 1 rule is that a list uses keyset pagination
+on `(created_at, id)` and never `OFFSET`.
+
+**Decision.** H6 owns **86–95** in `tests/reports-h6.test.ts`:
+
+| H6 behaviour | Test |
+| --- | --- |
+| Profit by product equals the GL for the period | 86 |
+| Best sellers and slow movers are ranked by quantity | 87 |
+| The VAT report splits sales by the rate each line used, matching the Z-report | 88 |
+| Z-reports page with their fiscal totals | 89 |
+| A closed day is read from the facts; today is read live | 90 |
+| Keyset pagination returns every product exactly once | 91 |
+| The daily facts are append-only, and a closed day's figure never changes | 92 |
+| `daily_product_sales` is a well-formed tenant table (RLS, indexes, FKs) | 93 |
+| A report reads only its own branch | 94 |
+| The report routes reject a limit above 100 and a branch out of scope | 95 |
+
+The per-product reports aggregate on `product_id` and paginate on it: each source branch of the
+union is itself a keyset page of at most `limit` products, ordered by `product_id`, and the merge of
+the (at most three) pages re-limited is exact, because the smallest `limit` product ids of a union
+lie in the union of the smallest `limit` of each branch. This keeps the closed-day side a streaming
+index scan over `daily_product_sales`; a per-product page over 1M facts measured ~6 ms. The ranked
+lists (best sellers, slow movers) aggregate every product by nature, so they read the period in
+full; that is acceptable because they are bounded by the product count, not the fact count.
+
+**Consequence.** A report is fast without a summary table or a materialised view, and the keyset
+cursor is the product id, so no page is ever skipped or repeated.
+
+## ADR-0046 — Daily facts are written at shift close; today is read live
+
+**Context.** The reports must show a day's figures, and they must match the ledger. The Phase 1 rule
+is that a mutable cache is allowed only when it can be rebuilt from an immutable ledger. The H6
+brief forbids materialised views and says today's figures come from the live sales tables bounded by
+today's date.
+
+**Decision.** `daily_product_sales` is an append-only fact table, one row per closed shift, per
+business date, per product and variant, holding the day's quantity, revenue (exclusive of tax), tax
+and cost of goods sold. It is written by `app.close_shift`, in the same transaction as the immutable
+Z-report, from that shift's completed sale lines. It is immutable (`app.enforce_immutable`) and the
+`authenticated` role has no write grant, so a figure cannot change after a day closes.
+
+A report reads **two** sources with one rule: a day that has closed is read from the facts, bounded
+by `business_date between from and least(to, current_date - 1)`; today is read live from `invoices`
+and `invoice_lines`, bounded by `invoice_date = current_date`. The two never overlap, so nothing is
+double-counted. `invoices` gains an index on `(org_id, branch_id, invoice_date, id)` so the today
+query does not scan every invoice of the org (ADR-0047).
+
+The facts are a rebuildable projection of the ledger, not a second source of truth: the shift's sale
+lines and their FIFO cost are themselves immutable ledger facts, so the rows can be recomputed. The
+per-rate VAT split is *not* part of the fact grain; the VAT report and the Z-report both read
+`invoice_lines` directly, so they always agree.
+
+**Consequence.** A closed day is a cheap, immutable read; today is live and always current; and no
+materialised view is needed. A shift that closes twice cannot double-write: the unique key
+`(org_id, branch_id, shift_id, business_date, product_id, variant_id)` makes the write idempotent.
+
+## ADR-0047 — The Z-report's fiscal totals are computed at read time
+
+**Context.** The Z-report row is immutable and written at close. The fiscal status of a shift's
+invoices (sent, pending, failed) changes *after* the close: a pending invoice is sent by the branch
+worker minutes later, or retried after an outage. Test 89 must show the truth now.
+
+**Decision.** `z_reports` stores the shift's financial totals (they are fixed at close) but **not**
+the fiscal totals. `app.report_z_reports` computes sent / pending / failed and their amounts at read
+time by joining `fiscal_invoices` to the shift's sales. The Z-report row therefore stays immutable
+and the report shows the current fiscal state.
+
+**Consequence.** The Z-report shows what the branch has actually submitted, even if that happened
+after the close. No column of an immutable table is ever updated to reflect a later event.
+
+## ADR-0048 — Returns net out of a report as negative rows
+**Context.** A credit note returns stock at the original FIFO cost and reverses revenue and VAT
+(CORE). The H6 reports are profit, VAT and Z-reports. A profit report that ignored returns would
+overstate revenue and profit against the GL, which the credit note already reduced.
+
+**Decision.** The profit, best-seller and slow-mover reports net a completed return out of the
+period as a negative row (negative quantity, revenue, tax and cost of goods sold), taken from
+`return_lines` joined to the original invoice line so the cost is the original FIFO cost. The
+reversal journal already reduced the GL, so the report and the GL stay equal (test 86). The VAT
+report reads `invoice_lines` directly, the same source the Z-report's `vat_by_rate` reads, so the
+two agree (test 88); a credit note is a separate document with its own journal, and the ZIMRA
+return is reconciled against that journal, not folded into the sales report.
+
+**Consequence.** A return in the period lowers revenue, tax, cost and profit in the per-product
+reports, exactly as it lowers the GL, so the two agree.
+
+## ADR-0049 — The owner console reads the same report functions as the branch
+
+**Context.** H6 asks for reports for the owner on the branch **and** in the cloud. The cloud holds
+what the branch has synced, so the cloud's figures are only as fresh as the last sync. The console
+must not hide that, and the two sides must not compute a figure two different ways, or they will
+drift.
+
+**Decision.** The owner console is `/reports`, a page in the same app, served on both deployments.
+It reads `/api/reports/*`, and those routes call the same `app.report_*` functions the branch
+console calls. There is no cloud-only aggregation. The page always shows a sync label from
+`app.report_last_sync` (the last event the cloud received, or the branch's own observation), so a
+stale figure is explained rather than surprising. A report never reads the service role: the routes
+run as the caller, so RLS scopes every row, and a branch a token does not scope is refused.
+
+**Consequence.** The branch and the cloud show the same figure from the same code; the console states
+when the branch last synced; and no second reporting path exists to drift from the first.

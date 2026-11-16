@@ -176,6 +176,20 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
 * **Staging + one-transaction commit beats per-row writes.** The H5 wizard COPYs rows into
   `import_rows`, validates set-based, then applies the whole file in one SQL function, so a bad file
   cannot leave half a catalogue behind (test 77) and a re-run is idempotent (natural key per kind).
+* **A report reads a closed day from the facts and today live.** `daily_product_sales` is written at
+  shift close in the same transaction as the Z-report; a report bounds the facts side at
+  `current_date - 1` and reads today from `invoices` + `invoice_lines`, so the two never overlap and
+  a figure is counted once (ADR-0046). No materialised view.
+* **Report reads keyset on the group, not the fact.** The per-product reports take a keyset page per
+  source branch (each at most `limit` products, ordered by `product_id`) and merge the pages; the
+  smallest `limit` ids of a union lie in the union of the smallest `limit` of each branch, so the
+  merge is exact and the closed-day side stays a streaming index scan. A union of facts + live rows
+  aggregated the whole set (~800 ms); the keyset page over 1M facts is ~6 ms (ADR-0045).
+* **Do not store what changes after an immutable write.** A Z-report row is immutable, but its
+  invoices' fiscal status changes after the close, so the report computes sent / pending / failed at
+  read time instead of storing them (ADR-0047).
+* **Money and reads.** All report money is `Decimal` in TS and NUMERIC(19,4) in PG; use
+  `moneyFromSql`/`money` at the boundary, never a JS number.
 
 ## Test numbering
 
@@ -186,6 +200,7 @@ owns 25 (`tests/fiscal-r6.test.ts`). H1 owns 49–51 (`tests/branch-h1.test.ts`)
 (`e2e/branch-offline.e2e.ts`); the H1 brief called them 16–18, but those are taken — ADR-0026 maps
 them. H2 owns 53–63 (`tests/sync-h2.test.ts`, ADR-0033). H3 owns 64–68
 (`tests/fiscal-h3.test.ts`, ADR-0038). H4 owns 69–74 (`tests/hardware-h4.test.ts`,
-ADR-0041). H5 owns 75–85 (`tests/import-h5.test.ts`, ADR-0042). A new
+ADR-0041). H5 owns 75–85 (`tests/import-h5.test.ts`, ADR-0042). H6 owns 86–95
+(`tests/reports-h6.test.ts`, ADR-0045). A new
 run continues from the highest number actually present; ranges in `docs/phase2/README.md` are
 indicative only (ADR-0010).

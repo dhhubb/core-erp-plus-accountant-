@@ -873,6 +873,55 @@ duplicates.
 branch) each carry `org_id`, `created_at`, forced RLS and the standard indexes, and are registered
 in `scripts/check-tenant-tables.sql`.
 
+## Reports and the owner console (H6)
+
+H6 gives the owner profit, VAT and Z-reports on the branch **and** in the cloud. See ADR-0045 to
+ADR-0049. It adds no core-table change; a report reads the ledger and the sales tables directly.
+
+**Two sources, one rule.** A day that has closed is read from `public.daily_product_sales`, an
+append-only fact table written by `app.close_shift` in the same transaction as the immutable
+Z-report. Today is read live from `invoices` + `invoice_lines`, bounded by `invoice_date`. The two
+never overlap (the facts side stops at `current_date - 1`), so a figure is counted once. The facts
+are a rebuildable projection of the immutable sale lines and their FIFO cost — not a second source of
+truth — so no materialised view is needed.
+
+**The reports.**
+
+| Report | Function | Endpoint |
+| --- | --- | --- |
+| Profit by product | `app.report_profit_by_product` | `GET /api/reports/profit` |
+| Best sellers | `app.report_best_sellers` | `GET /api/reports/best-sellers` |
+| Slow movers | `app.report_slow_movers` | `GET /api/reports/slow-movers` |
+| VAT (ZIMRA) | `app.report_vat` | `GET /api/reports/vat` |
+| Z-reports | `app.report_z_reports` | `GET /api/reports/z-reports` |
+| Last sync | `app.report_last_sync` | `GET /api/reports/last-sync` |
+| GL period profit | `app.report_gl_period_profit` | (read by the tests) |
+
+`app.report_gl_period_profit` reads `journal_lines` straight and is what the profit report must
+equal. The VAT report and the Z-report's `vat_by_rate` both read `invoice_lines`, so they always
+agree. A completed return nets out of the per-product reports as a negative row (ADR-0048).
+
+**The page.** `/reports` is the owner console and the branch view in one. Pick a period (defaults to
+the current month), pick a tab, and the page shows the figures plus a **last synced** label from
+`app.report_last_sync`, so a stale cloud figure is explained rather than surprising. Every list is a
+keyset page: the page asks for the next page with the cursor the previous page returned, never an
+offset.
+
+**Pagination and speed.** The per-product reports keyset on `product_id`; the ranked lists keyset on
+`(qty, product_id)`; the Z-report list keysets on `(created_at, id)`. Each source branch of the
+per-product union is itself a keyset page of at most `limit` products, so the closed-day side is a
+streaming index scan: a per-product page over 1M closed-day facts measured ~6 ms (ADR-0045).
+
+**Branch and cloud.** The same page and the same functions serve both deployments, so the console
+shows the branch's synced data, from the same code (ADR-0049). A report never reads the service role:
+the routes run as the caller, so RLS scopes every row, and a branch a token does not scope is refused.
+
+**The fact table.** `public.daily_product_sales` (org + branch) carries `org_id`, `created_at`, the
+high-volume branch index, a per-product index and the FK indexes, is immutable
+(`app.enforce_immutable`), and is registered in `scripts/check-tenant-tables.sql`. Its unique key
+`(org_id, branch_id, shift_id, business_date, product_id, variant_id)` makes the shift-close write
+idempotent.
+
 ## Adding a vertical module
 
 A vertical (Retail, Pharmacy, Hardware, School) sits on top of the core. It never edits a core
@@ -937,6 +986,9 @@ scan. Output is written to `docs/perf/`. The run records timings and does not fa
 | 52 | H1: branch till shows cloud-offline and still sells (e2e) | `e2e/branch-offline.e2e.ts` |
 | 53–63 | H2: offline sync engine (outbox, push, pull, retry, backup) | `tests/sync-h2.test.ts` |
 | 64–68 | H3: fiscal and numbering (queue, outage, blocks, exactly-once) | `tests/fiscal-h3.test.ts` |
+| 69–74 | H4: hardware and receipts (printer, ESC/POS, relay) | `tests/hardware-h4*.test.ts` |
+| 75–85 | H5: migration wizard (products, customers, opening stock) | `tests/import-h5.test.ts` |
+| 86–95 | H6: reports and the owner console (profit, VAT, Z-reports) | `tests/reports-h6.test.ts` |
 
 H1's tests are numbered 49–51 because R4 already owns 14–18 and R5 owns 19–24; the H1 brief called
 them 16–18. H2 continues from 52 (ADR-0033) and H3 from 63 (ADR-0038). ADR-0026, ADR-0033 and
