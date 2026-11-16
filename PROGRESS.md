@@ -1367,3 +1367,69 @@ $ scripts/check-tenant-tables.sql
 * No test is mocked: the admin tests run against the real local Postgres and call the route handlers
   with a real access token. The outbox test uses `fake-indexeddb`, an in-memory implementation of
   the browser's own IndexedDB interface.
+
+## A2 — Admin pricing UI
+
+**Status: complete.** Additive over the R2 pricing tables; no core table or core function signature
+changed (ADR-0054 to ADR-0058). Owner sets price lists, customer groups and promotions, with a live
+price preview.
+
+### Delivered
+
+* **Migration** `supabase/migrations/20260101140000_admin_pricing_a2.sql` — `app.admin_*` /
+  `app.create_*` **SECURITY INVOKER** functions for price lists, price list items (with margin vs
+  cost), customer groups and their members, promotions (list + reorder), and the live preview
+  (`app.admin_price_preview`, which calls R2's `app.get_price` and `app.assert_manual_discount`).
+* **TypeScript** `src/verticals/admin/pricing.ts` (data access, the COPY item import, the preview),
+  `src/verticals/admin/priceCsv.ts` (`parsePriceCsv`), `src/verticals/admin/types.ts` (A2 types),
+  `src/verticals/admin/PricingNav.tsx`.
+* **Routes** `src/app/api/admin/price-lists` (+ `[id]`, `[id]/items`), `customer-groups`
+  (+ `[id]`, `[id]/members`), `promotions` (+ `[id]`), `pricing-preview`.
+* **Pages** `/admin/price-lists`, `/admin/price-lists/[id]/items`, `/admin/customer-groups`,
+  `/admin/promotions`, `/admin/pricing-preview`.
+* **Tests** `tests/admin-a2.test.ts` — tests 105–107 (the brief called them 29–31; those are taken by
+  inventory, so ADR-0054 maps them and ADR-0010 applies).
+
+### Gate
+
+```
+$ supabase db reset
+Finished supabase db reset on branch master.   (all migrations apply to an empty DB)
+
+$ npm test
+ Test Files  22 passed (22)
+      Tests  168 passed (168)
+
+$ npm run build
+✓ Compiled successfully   (incl. /admin/price-lists, /admin/price-lists/[id]/items,
+                           /admin/customer-groups, /admin/promotions, /admin/pricing-preview)
+
+$ npm run lint
+✔ No ESLint warnings or errors
+
+$ scripts/check-fk-indexes.sql
+(0 rows)
+
+$ scripts/check-tenant-tables.sql
+(0 rows)
+```
+
+### Notes
+
+* **No pricing rule is re-implemented.** The console calls R2's `app.get_price` and
+  `app.assert_manual_discount`, so the preview shows the price the till would charge (ADR-0054).
+  Promotion writes go through `src/verticals/retail/pricing`, so `promos:{org_id}` is invalidated
+  exactly as a till write does.
+* **COPY import.** Items import with COPY into a per-session staging table, then one
+  `INSERT … ON CONFLICT DO UPDATE` merge — the stocktake pattern, idempotent on re-import
+  (ADR-0055). Test 107 imports 1000 items in well under 3 s.
+* **Keyset precision.** A bulk import writes one `created_at` for thousands of rows; a JS `Date`
+  cursor truncated it to milliseconds and stalled the next page. Every admin list selects
+  `created_at::text` and the cursor uses the exact text (ADR-0057).
+* **A list is keyed by kind.** R2's `unique (org_id, kind)` means one retail and one wholesale list
+  per org; a second is a 422 (ADR-0056).
+* **Manual-discount limit.** The preview returns the role's ceiling and calls
+  `app.assert_manual_discount`, so a discount above the limit, or one with no reason, is a 422
+  (ADR-0058, test 106).
+* No test is mocked: the A2 tests run against the real local Postgres and the real local Redis, and
+  call the route handlers with a real access token.

@@ -934,11 +934,25 @@ every row and a branch pulls the change on its next sync (ADR-0050).
 | `/admin/products` | The product list (keyset, "Load more") and the create form |
 | `/admin/products/[id]/variants` | A product's variants: size, colour, barcode, planning cost |
 | `/admin/batches` | Product batches with an expiry countdown (amber ≤ 30 days, red when expired) |
+| `/admin/price-lists` | The org's retail / wholesale price lists (USD, ZAR, ZWG) and their item counts |
+| `/admin/price-lists/[id]/items` | The editable item table: inline price edit, bulk re-price by category, CSV (COPY) import, margin vs cost |
+| `/admin/customer-groups` | Groups mapped to a price list, with their members (contacts) |
+| `/admin/promotions` | Promotions by priority (drag-to-reorder), with an active/type filter |
+| `/admin/pricing-preview` | Live preview of list price → promotion → manual discount, with the role's limit |
 
 **Endpoints.** `GET`/`POST /api/admin/categories`, `PATCH`/`DELETE /api/admin/categories/[id]`, and
 the same shape for `products`, `variants` and `batches`. A list is a keyset page on
 `(created_at, id)` (default 50, maximum 100); the SQL guards the limit too. A write that names
 another org is refused with 403, and a duplicate (SQLSTATE 23505) or a bad argument (22023) is a 422.
+
+**Pricing (A2).** `/api/admin/price-lists`, `/api/admin/price-lists/[id]/items`,
+`/api/admin/customer-groups`, `/api/admin/customer-groups/[id]/members`, `/api/admin/promotions`,
+and `/api/admin/pricing-preview`. The console does not re-implement any pricing rule: it calls R2's
+`app.get_price` and `app.assert_manual_discount` (ADR-0054), and promotion writes go through
+`src/verticals/retail/pricing` so the `promos:{org_id}` cache is invalidated exactly as a till write
+does. Items import with COPY into a staging table and one merge (ADR-0055), the same pattern as the
+stocktake. A list is keyed by `kind` (one retail and one wholesale per org, ADR-0056), and a keyset
+cursor keeps microsecond precision so a bulk import pages correctly (ADR-0057).
 
 **Barcodes.** A 13-digit barcode must carry a valid EAN-13 check digit, checked in SQL
 (`app.is_valid_ean13`) and mirrored in TypeScript (`src/verticals/admin/barcode.ts`). Anything else

@@ -43,6 +43,13 @@ export async function withWriteErrors<T>(fn: () => Promise<T>): Promise<T> {
     if (code === '22023') {
       throw new ApiError(422, (error as Error).message);
     }
+    if (code === 'P0002') {
+      throw new ApiError(404, (error as Error).message);
+    }
+    if (code === '23514' || code === '23503' || code === '23502') {
+      // A check/foreign-key/not-null guard the SQL raised is a client error, not a server fault.
+      throw new ApiError(422, (error as Error).message);
+    }
     throw error;
   }
 }

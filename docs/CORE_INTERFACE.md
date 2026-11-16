@@ -440,3 +440,45 @@ Additive, recorded in ADR-0050 to ADR-0053. It adds one nullable column to a cor
   same shape for `products`, `variants` and `batches`. A limit above 100 is refused (422); a body
   naming another org is refused (403); a duplicate (23505) or a bad argument (22023) is a 422.
 * Pages: `/admin/categories`, `/admin/products`, `/admin/products/[id]/variants`, `/admin/batches`.
+
+## A2 extension (Admin pricing UI)
+
+Additive, recorded in ADR-0054 to ADR-0058. It adds **no** core table and **no** core function
+signature change: it adds admin reads and catalogue writes over the R2 pricing tables, and the
+precedence rules stay in R2. Every new function is **SECURITY INVOKER**, so the caller's RLS scopes
+the rows; no admin path uses the service role.
+
+* Price lists: `app.admin_list_price_lists(org_id, limit, after_created_at, after_id)` (keyset, with
+  `item_count`), `app.create_price_list(org_id, name, kind, currency) -> uuid` (the R2
+  `unique (org_id, kind)` makes a second retail or wholesale list a 422, ADR-0056),
+  `app.update_price_list(...)`, `app.delete_price_list(org_id, id)`.
+* Price list items: `app.admin_list_price_list_items(org_id, price_list_id, category_id, limit,
+  after_created_at, after_id)` (keyset, optional category filter including descendants, with `cost`
+  and `margin` vs cost — the A1 planning cost when set, else the weighted average layer cost),
+  `app.admin_update_price_list_item(org_id, id, price)`,
+  `app.admin_bulk_price_by_category(org_id, price_list_id, category_id, percent) -> int` (re-prices a
+  category and its descendants).
+* Customer groups: `app.admin_list_customer_groups(...)` (keyset, with `member_count`),
+  `app.create_customer_group(org_id, name, price_list_id) -> uuid`, `app.update_customer_group(...)`,
+  `app.delete_customer_group(org_id, id)`, `app.admin_list_group_members(org_id, group_id, …)`
+  (keyset), `app.admin_assign_group_members(org_id, group_id, contact_ids, assign) -> int`.
+* Promotions: `app.admin_list_promotions(org_id, is_active, type, limit, after_created_at,
+  after_id)` (keyset with filters), `app.admin_reorder_promotions(org_id, ordered_ids) -> int`
+  (assigns priority by array position). The create / update / deactivate writes go through
+  `src/verticals/retail/pricing` (the R2 writers), so the `promos:{org_id}` cache is invalidated on
+  every write (ADR-0054).
+* Preview: `app.admin_price_preview(org_id, variant_id, group_id, at_time, role, qty,
+  manual_discount, reason)` returns the `app.get_price` result plus the precedence breakdown (1. price
+  list, 2. promotion, 3. manual discount) and the role's ceiling (`manual_max_amount`). It calls
+  `app.assert_manual_discount`, so a discount above the limit, or one with no reason, raises and the
+  route maps it to a 422 (ADR-0058).
+* TypeScript (`src/verticals/admin/`): `pricing.ts` (the data access, the COPY item import, the
+  preview), `priceCsv.ts` (`parsePriceCsv`), `types.ts` (the A2 types), `PricingNav.tsx` (shared nav).
+* Endpoints: `GET`/`POST /api/admin/price-lists` (POST also imports items with COPY),
+  `PATCH`/`DELETE /api/admin/price-lists/[id]`, `GET`/`PATCH /api/admin/price-lists/[id]/items`
+  (PATCH edits one item or bulk re-prices a category), `GET`/`POST /api/admin/customer-groups`,
+  `PATCH`/`DELETE /api/admin/customer-groups/[id]`, `GET`/`POST /api/admin/customer-groups/[id]/members`,
+  `GET`/`POST /api/admin/promotions` (POST also reorders), `PATCH`/`DELETE /api/admin/promotions/[id]`,
+  `POST /api/admin/pricing-preview`.
+* Pages: `/admin/price-lists`, `/admin/price-lists/[id]/items`, `/admin/customer-groups`,
+  `/admin/promotions`, `/admin/pricing-preview`.

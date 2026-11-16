@@ -1156,3 +1156,89 @@ column is nullable, so every existing row and every H5 import stays valid.
 
 **Consequence.** The admin has a cost to show and to plan with, the ledger cost stays the single
 source of truth for accounting, and the two can never be confused in a posting path.
+
+## ADR-0054 — A2 pricing reuses the R2 pricing engine; it is not re-implemented
+
+**Context.** A2 (the admin pricing console) must let an owner set price lists, customer groups and
+promotions and see a live preview. R2 already implemented the pricing engine: `app.get_price`
+resolves the list price (customer-group list, else retail), `app.apply_promotions` applies
+promotions by priority, and `app.assert_manual_discount` enforces the role's discount limit. If A2
+re-implemented any of that, the console and the till could disagree about a price.
+
+**Decision.** A2 adds only the reads and the catalogue-management writes the console needs
+(`app.admin_list_price_lists`, `app.admin_list_price_list_items`, `app.create_price_list`, …, and
+`app.admin_price_preview`). The preview calls `app.get_price` and `app.assert_manual_discount`
+rather than recomputing precedence, and the promotion writes go through `src/verticals/retail/pricing`
+so the `promos:{org_id}` cache is invalidated on every write exactly as a till write does. Every new
+function is SECURITY INVOKER.
+
+The A2 brief numbered its three tests 29–31, but the core already owns 29–31 (inventory, in
+`tests/inventory.test.ts`). A new run continues from the highest number actually present (ADR-0010),
+so A2 owns 105–107:
+
+| A2 brief | Canonical | Test |
+| --- | --- | --- |
+| 29 | 105 | Create list, import item, promotion discounts through the cache |
+| 30 | 106 | Preview precedence and the manual-discount role limit |
+| 31 | 107 | 1000-item COPY import under 3 s, and `get_price` uses an index |
+
+**Consequence.** The console and the till cannot drift: the preview shows the price the till would
+charge because it is the same SQL. The A2 migration adds no precedence rule of its own.
+
+## ADR-0055 — Price list items are imported with COPY into a staging table, then merged once
+
+**Context.** An owner imports thousands of (variant_id, price) pairs at a time. The stocktake import
+(H5) already streams CSV into a staging table with COPY. A one-INSERT-per-row import would be slow
+and would hit the `(price_list_id, variant_id)` unique key on re-import.
+
+**Decision.** `importPriceListItems` streams the lines into a per-session temp table
+(`copy _price_import … from stdin`), then merges with a single `INSERT … ON CONFLICT
+(price_list_id, variant_id) DO UPDATE`. One COPY plus one merge for a whole file, never one round
+trip per row. Re-importing a variant updates its price. The temp table is `on commit drop` and is
+created per call, so a second import in the same transaction reuses it cleanly.
+
+**Consequence.** A 1000-item import is two statements (test 107 asserts it completes in under 3 s),
+and a re-import is idempotent rather than a unique-key failure.
+
+## ADR-0056 — A price list is keyed by kind; the console shows the org's lists, not a free collection
+
+**Context.** The brief describes `/admin/price-lists` as a list of "retail/wholesale lists per
+currency". R2's `price_lists` table already carries `unique (org_id, kind)`, so an org has at most
+one `retail` and one `wholesale` list, each with its own currency.
+
+**Decision.** The console presents and manages exactly that: creating a kind that already exists is
+a 422 (the unique key), and each row shows its kind, currency and item count. A "list per currency"
+beyond one retail and one wholesale per org is not built, because R2's key does not allow it and
+changing that key is an R2 change, not an A2 change.
+
+**Consequence.** The console matches the schema the till already uses. If a future vertical needs
+several lists of the same kind, that is an R2 migration with its own ADR.
+
+## ADR-0057 — A keyset cursor keeps microsecond precision, not a JS Date
+
+**Context.** A keyset cursor is `(created_at, id)`. A JS `Date` truncates a Postgres `timestamptz` to
+milliseconds. A bulk COPY import writes thousands of rows in one statement, so they share one
+`created_at` down to the microsecond. A cursor truncated to the millisecond then loses the
+sub-millisecond tie-break and the next page stalls (discovered by test 107).
+
+**Decision.** Every admin list function selects `created_at::text as created_at_exact` and the
+cursor is built from that text, so the exact value round-trips. The API still returns
+`created_at` as an ISO string for display, and the cursor uses the exact text.
+
+**Consequence.** A page boundary inside a bulk-inserted batch advances correctly, and the admin
+lists page every row exactly once (tests 107 and the platform's test 35).
+
+## ADR-0058 — Manual-discount limits are enforced by `app.assert_manual_discount`, not by the console
+
+**Context.** The brief requires the preview to reject a manual discount above the role's limit and
+to require a reason. R2 already has `app.assert_manual_discount(org_id, role, subtotal, amount,
+reason)`, which raises when the amount exceeds `discount_limits.max_percent` or when the reason is
+blank.
+
+**Decision.** `app.admin_price_preview` calls `app.assert_manual_discount` for the submitted
+discount and returns the role's ceiling (`manual_max_amount`) either way, so the console can show
+the limit before the operator commits and the route maps the raise to a 422. The limit is never
+recomputed in TypeScript.
+
+**Consequence.** A discount above the limit, or one with no reason, is refused identically in the
+console and the till (test 106).

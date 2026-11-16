@@ -202,6 +202,8 @@ them. H2 owns 53–63 (`tests/sync-h2.test.ts`, ADR-0033). H3 owns 64–68
 (`tests/fiscal-h3.test.ts`, ADR-0038). H4 owns 69–74 (`tests/hardware-h4.test.ts`,
 ADR-0041). H5 owns 75–85 (`tests/import-h5.test.ts`, ADR-0042). H6 owns 86–95
 (`tests/reports-h6.test.ts`, ADR-0045). A1 (admin products UI) owns 96–104
-(`tests/admin-a1.test.ts`, ADR-0050). A new
+(`tests/admin-a1.test.ts`, ADR-0050). A2 (admin pricing UI) owns 105–107
+(`tests/admin-a2.test.ts`, ADR-0054; the A2 brief called them 29–31, but those are taken by
+inventory). A new
 run continues from the highest number actually present; ranges in `docs/phase2/README.md` are
 indicative only (ADR-0010).
