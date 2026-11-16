@@ -848,10 +848,12 @@ $ scripts/check-tenant-tables.sql
   (test 9), the schema check (test 10) and the high-volume index check (test 11) cover them without
   a special case.
 * H2's tests are numbered 53–63 because H1 owns 49–52. ADR-0033 records the mapping.
-* The cloud records each branch event once in `sync_inbox` and does not re-derive the branch's
-  ledger; the branch's immutable ledger stays authoritative (ADR-0034). Replaying a sale through
-  `app.create_invoice` on the cloud would take a second gapless number and a second FIFO consumption,
-  i.e. double-post; that is an open item, not built here.
+* The cloud replays each branch event once into its own tables through the same posting functions a
+  live sale uses, made idempotent by the inbox claim on `(org_id, event_id)` and by
+  `app.sync_pos_sale`'s own `client_sale_id` idempotency (ADR-0034). Branch and cloud are separate
+  databases in production, so each keeps its own gapless numbers and FIFO layers. The credit-note
+  event carries no line detail in this phase, so its replay only records the inbox row; a full replay
+  is an H3 item.
 * Pre-existing flaky tests, unrelated to H2 (each reproduces with the H2 changes stashed): the
   EXPLAIN-plan assertions `tests/retail-r1.test.ts` test 2 (`products_name_trgm_idx`) and
   `tests/retail-r2.test.ts` test 8 (the `get_price` index). On a freshly seeded database the planner

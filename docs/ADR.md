@@ -718,25 +718,37 @@ The mapping is:
 
 **Consequence.** No number is reused and no test is dropped.
 
-## ADR-0034 — The cloud records each branch event once; it does not re-derive the branch's ledger
+## ADR-0034 — The cloud replays each branch event once into its own ledger, deduped by event UUID
 
-**Context.** The branch is the system of record for the sales it rings (ADR-0023): it holds the
-authoritative, immutable ledger locally. When a branch pushes an event, the cloud could either (a)
-record the event durably and let the branch's ledger stand as the source of truth, or (b) replay the
-event through the same posting functions to reconstruct the ledger on the cloud.
+**Context.** The branch is the system of record for the sales it rings (ADR-0023): it holds an
+immutable ledger locally and keeps selling with the cloud down. When a branch pushes an event, the
+cloud must end up with the same facts — but a push is at-least-once, so the cloud must not apply an
+event twice.
 
-**Decision.** The cloud records each event exactly once in `public.sync_inbox` (deduped by
-`(org_id, event_id)`) and assigns master-data changes a per-org sequence. The push path is the
-durable, idempotent ingest boundary; the branch's immutable ledger remains authoritative. The
-`app.sync_replay_*` helpers exist for a future consolidated-reporting projection, but they are not on
-the push path, and the branch is the only writer of its own facts.
+**Decision.** The cloud replays each event into its OWN tables through the SAME posting functions a
+live sale uses (`app.sync_replay_sale` → `app.sync_pos_sale` → `app.create_invoice`, and the receipt,
+adjustment and payment replays likewise). Two independent mechanisms make the replay idempotent:
 
-**Objection / open item.** A strict "the cloud holds a full copy of every branch's ledger" reading
-would want the replay on the push path. That is deliberately not built in this phase: replaying a
-sale through `app.create_invoice` on the cloud would take a second gapless invoice number and a
-second FIFO consumption, i.e. it would double-post. If Phase 2 wants consolidated ledgers, the cloud
-needs a dedicated, clearly-separated projection that does not reuse the branch's number series and
-stock layers. Recorded here as an open item; do not block H2 on it.
+1. The inbox claim. `app.sync_apply_event` first inserts into `public.sync_inbox` with
+   `ON CONFLICT (org_id, event_id) DO NOTHING`. When the insert claims nothing, the event is a
+   duplicate and the replay is skipped.
+2. The posting functions are themselves idempotent on the natural key the payload carries
+   (`app.sync_pos_sale` on `client_sale_id`), so even two events that carried the same sale cannot
+   double-post.
+
+The branch and the cloud are separate Postgres instances in production, so a replayed sale takes the
+CLOUD's own gapless invoice number and consumes the CLOUD's own FIFO layers; each side keeps a
+consistent ledger and the event UUID ties them together. (When a test harness points both sides at
+one physical database, the branch's own row already claimed the `client_sale_id`, so the replay is a
+no-op there — still no double-post.)
+
+Two deliberate limits in this phase:
+
+* Branch-local ids the cloud does not have (a shift) are not replayed; the branch's own `pos_sales`
+  row keeps them.
+* The credit-note event carries no line detail, so `app.sync_replay_credit_note` only records the
+  inbox row (so the event is not lost or re-applied) and leaves the reversal to reconciliation. A
+  full credit-note replay needs the note's lines in the payload — an H3 item.
 
 **Consequence.** Pushing is safe to retry and never double-posts. Tests 54, 56 and 62 pin the
 idempotency.
