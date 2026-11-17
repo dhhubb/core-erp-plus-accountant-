@@ -95,6 +95,14 @@ export function useReport<T>(path: string): ReportState<T> {
 
   useEffect(() => {
     let cancelled = false;
+    if (path === '') {
+      setData(null);
+      setError(null);
+      setLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
     setLoading(true);
     accountingGet<T>(path)
       .then((payload) => {
