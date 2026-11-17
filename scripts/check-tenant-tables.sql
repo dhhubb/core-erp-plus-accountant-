@@ -32,7 +32,8 @@ with tenant_tables as (
       'device_registrations', 'cashier_pins', 'sync_state',
       'sync_outbox', 'sync_inbox', 'master_data_changes', 'branch_master_data',
       'sync_conflicts', 'sync_backups',
-      'daily_product_sales'
+      'daily_product_sales',
+      'supplier_bills'
     )
 ),
 cols as (

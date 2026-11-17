@@ -97,6 +97,8 @@ export const TENANT_TABLES: TenantTable[] = [
   { name: 'sync_backups', scope: 'branch', highVolume: true, partitioned: false },
   // H6 (reports): the append-only daily product-sales facts and the report reads over them.
   { name: 'daily_product_sales', scope: 'branch', highVolume: true, partitioned: false },
+  // AC (accountant): the accounts-payable sub-ledger.
+  { name: 'supplier_bills', scope: 'branch', highVolume: true, partitioned: false },
 ];
 
 export const PARTITIONED_TABLES = TENANT_TABLES.filter((t) => t.partitioned).map((t) => t.name);
@@ -622,6 +624,14 @@ export async function seedOneRowPerTenantTable(
        (org_id, branch_id, business_date, shift_id, product_id, qty, gross, tax, cogs)
      values ($1, $2, current_date - 1, $3, $4, 1, 10, 1.5, 4)`,
     [orgId, branchId, shiftId, productId],
+  );
+
+  // AC (accountant): one open supplier bill for the seed contact.
+  await sql(
+    `insert into public.supplier_bills
+       (org_id, branch_id, contact_id, bill_no, bill_date, due_date, subtotal, tax_total, total)
+     values ($1, $2, $3, $4, current_date - 10, current_date + 20, 100, 15, 115)`,
+    [orgId, branchId, contactId, `SEED-BILL-${randomUUID().slice(0, 8)}`],
   );
 
   return {
