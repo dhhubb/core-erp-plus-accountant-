@@ -190,6 +190,35 @@ psql "$DATABASE_URL" -f scripts/check-tenant-tables.sql  # must be 0 rows
   read time instead of storing them (ADR-0047).
 * **Money and reads.** All report money is `Decimal` in TS and NUMERIC(19,4) in PG; use
   `moneyFromSql`/`money` at the boundary, never a JS number.
+* **A report is a `stable` read function over `journal_lines`, never a stored balance.** The AC
+  statements (`app.report_trial_balance`, `report_profit_and_loss`, `report_balance_sheet`,
+  `report_changes_in_equity`, `report_cash_flow`, `report_general_ledger`, `report_journal_list`,
+  `report_vat_return`) share one accounts-with-activity read (`app.report_account_activity`) and one
+  section rule (`app.account_statement_section`), so they reconcile by construction (ADR-0065). They
+  are `security invoker`, so RLS scopes the rows; a report read needs no service role.
+* **A `timestamptz` returned to `pg` loses microseconds, so a keyset cursor must be text.** `pg`
+  parses `timestamptz` into a JS `Date` (millisecond precision). A cursor built from that value no
+  longer equals the stored microsecond value, and the next page silently returns nothing. The
+  journal and ledger functions return `created_at` as `text` (`::text`), and the cursor round-trips
+  the exact string (ADR-0057). This is why `report_journal_list` and `report_general_ledger` cast
+  every timestamp.
+* **A running balance must be numbered over the whole period, then paged.** Computing the window
+  function inside the keyset-paginated CTE resets the balance at each page boundary. `report_general_ledger`
+  computes `running_balance` in a `period_rows` CTE over the whole range and applies the keyset
+  filter in a second CTE, so page two continues from page one (test 121).
+* **The AP sub-ledger is `supplier_bills`, posted through `app.post_supplier_bill`.** There is no
+  purchase-side equivalent of `invoices`, so AP aging reads this new table. Posting goes through
+  `app.post_balanced_journal`; `app.pay_supplier_bill` caps a payment at the open balance and both
+  lock the bill `FOR UPDATE`, mirroring `app.allocate_payment` (ADR-0066, tests 118–120).
+* **The statements' section split is a code rule, not the account type alone.** `2200` (VAT Input) is
+  typed `asset` in the core chart, so a "code starts with 1 → current asset" rule misclassifies it.
+  `app.account_statement_section` uses explicit sub-ranges: `15`/`16` → non-current asset, `25`/`26`
+  → non-current liability, `50` → cost of sales; everything else in the type is current (or the
+  type's own section).
+* **A CSV export calls the same domain function as the JSON response.** Each `api/accounting/*`
+  route accepts `format=csv` and serialises the same rows with `toCsv`
+  (`src/accounting/export.ts`, RFC-4180 quoting). The on-screen and exported figures cannot drift
+  (ADR-0067, tests 125 and 128).
 
 ## Test numbering
 
@@ -205,6 +234,7 @@ ADR-0041). H5 owns 75–85 (`tests/import-h5.test.ts`, ADR-0042). H6 owns 86–9
 (`tests/admin-a1.test.ts`, ADR-0050). A2 (admin pricing UI) owns 105–107
 (`tests/admin-a2.test.ts`, ADR-0054; the A2 brief called them 29–31, but those are taken by
 inventory). A3 (admin operations UI) owns 108–111 (`tests/admin-a3.test.ts`, ADR-0059; the A3 brief
-called them 32–35, but those are taken by Phase 1 sales). A new
+called them 32–35, but those are taken by Phase 1 sales). AC (the accountant) owns 112–133
+(`tests/accountant-ac.test.ts`, ADR-0065/0066/0067). A new
 run continues from the highest number actually present; ranges in `docs/phase2/README.md` are
 indicative only (ADR-0010).

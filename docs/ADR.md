@@ -1334,3 +1334,56 @@ to a fixed-scale string.
 
 **Consequence.** Nothing on the console updates or deletes a Z-report, and the read is a single
 indexed lookup (test 111 closes a shift and reads the report back).
+
+## ADR-0065 — The accountant reads the ledger; no report stores a balance
+
+**Context.** The AC extension adds the financial statements an owner signs: trial balance, profit and
+loss, statement of financial position, statement of changes in equity, statement of cash flows,
+receivables and payables aging, general ledger, journals and the VAT return. Every one could be
+served from a stored balance table, which would need a trigger on every posting and would drift the
+moment a journal was reversed.
+
+**Decision.** Every report is a read-only `app.report_*` function over the immutable ledger
+(`journals` + `journal_lines`) and the sales and purchase documents. The functions are `security
+invoker` and `stable`, return typed rows with `NUMERIC` money columns (never jsonb), and are granted
+to `authenticated` and `service_role`. The statements read the same `journal_lines` over the same
+range, so a trial balance, a P&L and a balance sheet reconcile by construction, and a closed period
+reprints identically to an open one. The statements share one accounts-with-activity read,
+`app.report_account_activity` (opening, debit, credit, closing per account for a range), and one
+section rule, `app.account_statement_section`.
+
+**Consequence.** No balance is stored and nothing can drift; a report is only ever as slow as the
+index scan behind it, and correctness does not depend on any cache. A reversal is a new journal, so
+every report reflects it with no extra bookkeeping. Money is a NUMERIC in SQL and a Decimal in
+TypeScript (`moneyFromSql`), so no figure is ever a JS float (tests 112–126).
+
+## ADR-0066 — The AP sub-ledger is a new table, posted through one balanced function
+
+**Context.** Accounts-receivable aging reads the core `invoices` table, whose open balance is
+`total - amount_paid`. There is no purchase-side equivalent: `app.post_receipt` posts stock at a cost
+and credits AP, but it records no supplier document, so AP cannot be aged by supplier or due date.
+
+**Decision.** The AC migration adds a `supplier_bills` table (additive, RLS-scoped, org and branch
+keyed) and two `security definer` functions: `app.post_supplier_bill(...)` posts Dr expense + Dr
+input VAT / Cr AP through `app.post_balanced_journal`, and `app.pay_supplier_bill(...)` posts Dr AP /
+Cr bank. A payment cannot exceed the open balance, exactly as `app.allocate_payment` caps a customer
+payment, and both functions lock the bill row `FOR UPDATE`. The AP aging report reads the open
+balance of the bills, so it ages from the due date.
+
+**Consequence.** AP has a document of record and can be aged, and the sub-ledger reconciles with the
+AP control account (2000) because the posting goes through the same balanced-journal hook as every
+other operation (tests 118–120). No core table or function changed.
+
+## ADR-0067 — Every report exports as CSV through the same route
+
+**Context.** The brief requires the statements be formatted and exportable. A separate export
+endpoint per report would duplicate the query and could drift from the on-screen figures.
+
+**Decision.** Each accountant route accepts `format=csv`. The route calls the same domain function as
+the JSON response and serialises the same rows with `toCsv` (`src/accounting/export.ts`), a small
+RFC-4180 writer that quotes a field containing a comma, a quote or a newline. The download is served
+with a `text/csv` content type and an attachment `content-disposition`.
+
+**Consequence.** The exported figures are the on-screen figures by construction, and one writer
+handles quoting for every report (tests 125 and 128 assert the header row and the attachment
+headers).

@@ -518,3 +518,48 @@ admin path uses the service role.
   `GET`/`POST /api/admin/stocktake` (POST: open, import lines, or close),
   `GET /api/admin/stocktake/[id]?created_at=`, `GET /api/admin/warehouses`.
 * Pages: `/admin/laybys`, `/admin/laybys/[id]`, `/admin/returns`, `/admin/shifts`, `/admin/stocktake`.
+
+## AC extension (The accountant: financial statements and the books)
+
+Additive, recorded in ADR-0065 to ADR-0067. It changes **no** core table shape and **no** core
+function signature: every statement is a read-only `app.report_*` function over the immutable ledger
+(`journals` + `journal_lines`) and the sales and purchase documents, so the statements reconcile by
+construction and a closed period reprints identically (ADR-0065). Every function is **SECURITY
+INVOKER** and **STABLE**, so the caller's RLS scopes the rows; no accounting path uses the service
+role. Money is a `NUMERIC` column returned as a string, never a jsonb number.
+
+* Statements: `app.report_trial_balance(org_id, branch_id, from, to, include_zero)` (opening, debit,
+  credit, closing per account), `app.report_profit_and_loss(org_id, branch_id, from, to)` (revenue,
+  cost of sales, operating expenses, gross and net profit), `app.report_balance_sheet(org_id,
+  branch_id, as_of)` (assets current/non-current, liabilities current/non-current, equity, and a
+  `balanced`/`difference` check), `app.report_changes_in_equity(org_id, branch_id, from, to)`
+  (opening, movement, closing per equity account plus the period profit),
+  `app.report_cash_flow(org_id, branch_id, from, to)` (the indirect method: operating, investing and
+  financing sections and an opening-to-closing cash reconciliation).
+* Sub-ledgers and controls: `app.report_ar_aging(org_id, branch_id, as_of)` and
+  `app.report_ap_aging(org_id, branch_id, as_of)` (by contact/supplier, buckets `current`, `days_1_30`,
+  `days_31_60`, `days_61_90`, `over_90`, plus a control-account balance and a `reconciles` flag);
+  `app.report_vat_return(org_id, branch_id, from, to)` (output and input VAT by rate, net payable).
+* The books: `app.report_general_ledger(org_id, branch_id, account_id, from, to, limit, after_date,
+  after_created_at, after_id)` (a keyset page with a running balance numbered over the whole period
+  before paging, ADR-0057), `app.report_journal_list(org_id, branch_id, from, to, source_type, limit,
+  after_created_at, after_id)` (keyset), `app.report_journal(org_id, journal_id, journal_created_at)`
+  and `app.report_journal_lines(org_id, journal_id, journal_created_at)` (read by primary key because
+  the partition key is part of the key). Timestamps return as `text` so a keyset cursor round-trips
+  microseconds exactly.
+* The AP sub-ledger: a new additive table `supplier_bills` (RLS-scoped, org and branch keyed, seeded
+  in the tenant-table check) with `app.post_supplier_bill(...)` (Dr expense + Dr input VAT / Cr AP
+  through `app.post_balanced_journal`) and `app.pay_supplier_bill(...)` (Dr AP / Cr bank, capped at
+  the open balance and locking the bill `FOR UPDATE`, mirroring `app.allocate_payment`, ADR-0066).
+* Section rule: `app.account_statement_section(account_type, code)` maps an account to a statement
+  section. It uses explicit code sub-ranges (`15`/`16` non-current asset, `25`/`26` non-current
+  liability, `50` cost of sales), because `2200` (VAT Input) is typed `asset` and a "starts with 1"
+  rule would misclassify it.
+* TypeScript (`src/accounting/`): `reports.ts` (the typed data access, Decimal money at the
+  boundary), `supplier-bills.ts` (post/pay/list), `export.ts` (`toCsv`, the RFC-4180 writer every
+  report shares).
+* Endpoints: `GET /api/accounting/{trial-balance,profit-and-loss,balance-sheet,changes-in-equity,
+  cash-flow,ar-aging,ap-aging,vat-return,general-ledger,journals,journals/[id],accounts}`, each
+  accepting `format=csv` to download the same rows the JSON response returns (ADR-0067).
+* Pages: `/accounting` (index) and `/accounting/{trial-balance,profit-and-loss,balance-sheet,
+  changes-in-equity,cash-flow,receivables,payables,general-ledger,journals,vat-return}`.
